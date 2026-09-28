@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b0f14" />
+  <title>KenDrive</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="phone" id="phone">
+    <header class="topbar">
+      <div class="brand">
+        <h1>KenDrive</h1>
+        <span class="sub" id="where">Locating…</span>
+      </div>
+      <div class="top-actions">
+        <span class="pill" id="conn"><i></i><b>Offline</b></span>
+        <button class="icon-btn" id="menu-btn" aria-label="Options">
+          <svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>
+        </button>
+      </div>
+      <div class="menu" id="menu" hidden>
+        <label><input type="checkbox" id="demo-loc" /> Use demo location (Dubai)</label>
+        <button id="sim-btn" disabled>▶ Simulate drive along route</button>
+        <button id="recenter-btn">◎ Recenter map</button>
+        <button id="hangup-btn" disabled>✕ End voice session</button>
+      </div>
+    </header>
+
+    <main class="stage">
+      <div class="orb-wrap">
+        <button class="orb" id="orb" data-state="idle" aria-label="Start or stop KenDrive voice session">
+          <span class="orb-gl" id="orb-gl"></span>
+        </button>
+      </div>
+      <!-- Card view (AppSheet "Large" layout): image · header badge · title · subtitle · description · actions -->
+      <section class="cards" id="cards" aria-label="Results">
+        <div class="cards-head">
+          <span id="cards-title">Results</span>
+          <button class="icon-btn small" id="cards-close" aria-label="Close results">✕</button>
+        </div>
+        <div class="cards-rail" id="cards-rail"></div>
+      </section>
+    </main>
+
+    <!-- Map drawer: drag (or tap) the grip to move between peek, half and full -->
+    <section class="drawer" id="drawer" data-snap="peek" aria-label="Map">
+      <div class="drawer-grip" id="drawer-grip" role="button" tabindex="0" aria-label="Show map" aria-expanded="false">
+        <div class="grab"></div>
+        <div class="drawer-head">
+          <svg class="drawer-icon" viewBox="0 0 24 24"><path d="M9 4 3 6v14l6-2 6 2 6-2V4l-6 2-6-2zM9 4v14M15 6v14"/></svg>
+          <div class="drawer-text">
+            <div class="drawer-title" id="drawer-title">Map</div>
+            <div class="drawer-sub" id="drawer-sub">Your location</div>
+          </div>
+          <div class="drawer-actions">
+            <!-- Mirrors the big orb while the drawer covers it -->
+            <button class="orb mini" id="mini-orb" data-state="idle" aria-label="Start or stop KenDrive voice session">
+              <span class="orb-gl" id="mini-orb-gl"></span>
+            </button>
+            <svg class="drawer-chevron" viewBox="0 0 24 24"><path d="m6 15 6-6 6 6"/></svg>
+          </div>
+        </div>
+      </div>
+      <div class="drawer-body">
+        <div id="map" aria-label="Map"></div>
+        <div class="route-card" id="route-card" hidden>
+          <div class="route-main">
+            <div>
+              <div class="eta" id="route-eta">–</div>
+              <div class="route-sub" id="route-sub"></div>
+            </div>
+            <button class="icon-btn small" id="route-clear" aria-label="Clear route">✕</button>
+          </div>
+          <div class="avoided" id="route-avoided" hidden></div>
+        </div>
+      </div>
+    </section>
+
+    <div class="toast" id="toast" hidden></div>
+
+    <section class="sheet" id="sheet">
+      <div class="chips" id="chips">
+        <button data-say="Where is the nearest petrol bunk?"><svg viewBox="0 0 24 24"><path d="M5 3h8v8H5zM5 13h8v8H5zM15 7l3 3v8a1.5 1.5 0 0 0 3 0V9l-3-3"/></svg>Petrol</button>
+        <button data-say="Find me an EV charger"><svg viewBox="0 0 24 24"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>EV charge</button>
+        <button data-say="Where can I park?"><svg viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="18" rx="3"/><path d="M10 17V7h3a3 3 0 0 1 0 6h-3"/></svg>Parking</button>
+        <button data-say="Any good restaurants nearby?"><svg viewBox="0 0 24 24"><path d="M7 2v9M4 2v5a3 3 0 0 0 6 0V2M7 11v11M17 2c-2 2-3 5-3 8h3v12"/></svg>Food</button>
+        <button data-say="Where do I get the best pasta?"><svg viewBox="0 0 24 24"><path d="M4 11h16a8 8 0 0 1-16 0zM8 11c0-3 1-6 4-7M12 11c0-3 1.5-5 4-6"/></svg>Best pasta</button>
+        <button data-say="Where is the nearest hospital?"><svg viewBox="0 0 24 24"><path d="M9 3h6v6h6v6h-6v6H9v-6H3V9h6z"/></svg>Hospital</button>
+        <button data-say="Are there any road congestions ahead?"><svg viewBox="0 0 24 24"><path d="M12 3 2 21h20zM12 10v5M12 18v.5"/></svg>Traffic ahead?</button>
+      </div>
+
+      <form class="bar" id="text-form" autocomplete="off">
+        <input id="text-input" placeholder="Type instead of talking…" />
+        <button type="submit" class="icon-btn" aria-label="Send">
+          <svg viewBox="0 0 24 24"><path d="M3 20 21 12 3 4v6l12 2-12 2z"/></svg>
+        </button>
+        <button type="button" class="report-btn" id="report-btn" hidden>
+          <svg viewBox="0 0 24 24"><path d="M4 7h3l2-3h6l2 3h3v13H4z"/><circle cx="12" cy="13" r="4"/></svg>
+          Report
+        </button>
+      </form>
+    </section>
+
+    <div class="modal" id="report-modal" hidden>
+      <form class="modal-card" id="report-form">
+        <h2>Report a blocked road</h2>
+        <p class="muted">Shared instantly with every driver on the map.</p>
+        <label class="photo-drop" id="photo-drop">
+          <input type="file" id="photo-input" name="photo" accept="image/*" capture="environment" hidden />
+          <img id="photo-preview" alt="" hidden />
+          <span id="photo-hint">Take or choose a photo</span>
+        </label>
+        <input name="note" id="report-note" placeholder="What's happening? e.g. Ganesha procession" maxlength="280" />
+        <div class="loc-row">
+          <span id="report-loc">At your current location</span>
+          <button type="button" class="link" id="pick-on-map">Pick on map</button>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="ghost" id="report-cancel">Cancel</button>
+          <button type="submit" class="primary" id="report-submit">Share report</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@rive-app/webgl2@2.37.1/rive.js"></script>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

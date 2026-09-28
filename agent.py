@@ -1,0 +1,637 @@
+"""KenDrive – a LiveKit voice agent (Gemini Live) for drivers.
+
+Tools: nearby places (Places API New), route planning that avoids crowd-reported
+blockages (Routes API → OSRM fallback), road conditions ahead, DuckDuckGo web/news
+search, Google Maps Grounding Lite, and hands-free blockage reports.
+
+Run:  uv run agent.py dev
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+from dataclasses import dataclass, field
+from typing import Any, Literal
+
+import httpx
+from dotenv import load_dotenv
+from livekit import rtc
+from livekit.agents import Agent, AgentServer, AgentSession, JobContext, RunContext, ToolError, cli, function_tool
+from livekit.plugins import google
+
+from app.geo import LatLng, bearing, distance_to_path, haversine, offset, path_length
+from app.dish import best_places_for_dish
+from app.ev_parking import find_chargers, find_parking, venue_parking
+from app.maps import Maps, MapsError, Route
+from app.search import web_search as ddgs_search
+
+load_dotenv()
+log = logging.getLogger("kendrive")
+
+AGENT_NAME = os.getenv("AGENT_NAME", "kendrive")
+# Latest Gemini Live (native audio) model. Tools run NON_BLOCKING on 3.8, so it keeps talking while they run.
+GEMINI_LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-3.8-live")
+GEMINI_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+API_BASE = os.getenv("API_BASE", "http://localhost:8000")
+# Crowd-sourced "road blocked" reports (photo reports, rerouting around them, spoken alerts).
+# Switched off for now; set ENABLE_ROAD_REPORTS=true in .env to bring it back.
+ROAD_REPORTS = os.getenv("ENABLE_ROAD_REPORTS", "false").lower() in ("1", "true", "yes")
+ON_ROUTE_M = 150  # a report closer than this to a route polyline blocks it
+NEARBY_ALERT_M = 5000
+TRAFFIC_WORDS = {"traffic", "jam", "diversion", "diversions", "diverted", "procession", "congestion", "closed",
+                 "closure", "accident", "waterlogging", "waterlogged", "rally", "protest", "bandh", "blocked",
+                 "advisory", "immersion", "flyover", "road", "roads"}
+CITY_ALIASES = {"bengaluru": ("bangalore",), "mumbai": ("bombay",), "chennai": ("madras",), "kolkata": ("calcutta",),
+                "gurugram": ("gurgaon",)}
+
+INSTRUCTIONS = """You are KenDrive, a voice co-pilot for someone who is DRIVING right now (India or the UAE).
+Style: calm, brief, spoken. One to three short sentences. No lists, no markdown, no URLs, no
+coordinates. Round distances ("about 800 metres", "2.4 kilometres") and times ("12 minutes").
+The driver may start with "Hey KenDrive" — that's just your wake phrase; answer the question.
+Understand local usage: "petrol bunk" = fuel station, "signal" = traffic light, "Salik" = Dubai toll gate.
+
+Always use tools instead of guessing:
+- EV charging ("charger", "charge my car", "low battery") → find_ev_chargers. If they mention battery %
+  or range, pass range_km. If a route is active and they want one "on the way", set along_route.
+  Lead with the best option: name, how many ports are free (or that status is unknown), power, and
+  how long to get there; mention how much range 30 minutes adds.
+- Parking ("where can I park", "parking near X") → find_parking. By default it looks near the active
+  destination. Mention the destination's own parking first (valet/lot) and any reviewer warnings,
+  then the best nearby option with walking time. Never claim a spot is free — there is no live data.
+  After plan_route to a busy place (mall, restaurant, downtown), offer to find parking.
+- Fuel, restaurants, hospitals, ATMs, pharmacies, mechanics → find_nearby.
+- "Where do I get the best / good <dish>?" (e.g. best pasta, bolognese, biryani, filter coffee) →
+  find_best_dish with the most specific dish (for "best pasta" use "bolognese pasta" unless they name
+  another pasta). Say you're checking reviews, then recommend the top place and give the proof in a few
+  words ("it's on their menu", "reviewers rave about the bolognese"). Never recommend a place whose
+  evidence is "no".
+{routing_rules}
+- Local events, festivals, diversions, news, general questions → web_search.
+- Questions about a specific place (reviews, is it good, what's it known for) → ask_google_maps.
+For medical emergencies, give the nearest hospital and remind them to call an ambulance: 108 in
+India, 998 in the UAE.
+Never encourage looking at the phone; the map on screen updates by itself."""
+
+ROUTING_RULES_WITH_REPORTS = """- "Take me to / route to / how do I get to X" → plan_route. It automatically avoids roads that other
+  drivers reported as blocked; tell the driver if you picked an alternative and why, then give only the
+  first one or two turns.
+- "Any traffic / congestion / problems ahead?" → check_road_conditions_ahead. Mention crowd reports
+  first (e.g. a Ganesha procession), then traffic delay, then relevant news. If something blocks
+  their route, offer to reroute.
+- Driver says a road is blocked / there's an accident here → report_blockage."""
+
+ROUTING_RULES = """- "Take me to / route to / how do I get to X" → plan_route; give only the first one or two turns.
+- "Any traffic / congestion / problems ahead?" → check_road_conditions_ahead. Mention traffic delay on
+  their route, then relevant local news (processions, diversions, closures). If nothing is known, say so
+  briefly rather than guessing."""
+
+INSTRUCTIONS = INSTRUCTIONS.replace("{routing_rules}", ROUTING_RULES_WITH_REPORTS if ROAD_REPORTS else ROUTING_RULES)
+
+
+@dataclass
+class DriveState:
+    room: rtc.Room
+    maps: Maps
+    http: httpx.AsyncClient
+    route: Route | None = None
+    destination: dict[str, Any] | None = None
+    announced: set[str] = field(default_factory=set)
+
+    # ----- driver location comes from the web app via participant attributes
+    def driver(self) -> rtc.RemoteParticipant | None:
+        for p in self.room.remote_participants.values():
+            if p.kind != rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
+                return p
+        return None
+
+    def location(self) -> LatLng:
+        p = self.driver()
+        if p and p.attributes.get("lat") and p.attributes.get("lng"):
+            return float(p.attributes["lat"]), float(p.attributes["lng"])
+        raise ToolError("I don't have the driver's location yet. Ask them to allow location access in the app.")
+
+    def heading(self) -> float | None:
+        p = self.driver()
+        h = p.attributes.get("heading") if p else None
+        return float(h) if h not in (None, "", "null") else None
+
+    async def push_ui(self, event: dict[str, Any]) -> None:
+        """Send a UI update (markers, routes) to the driver's screen."""
+        p = self.driver()
+        if not p:
+            return
+        try:
+            await self.room.local_participant.send_text(
+                json.dumps(event), topic="ui.event", destination_identities=[p.identity], compress=False
+            )
+        except Exception as e:
+            log.warning("push_ui failed: %s", e)
+
+    async def reports(self) -> list[dict[str, Any]]:
+        if not ROAD_REPORTS:
+            return []
+        try:
+            r = await self.http.get(f"{API_BASE}/api/reports")
+            return r.json()
+        except httpx.HTTPError as e:
+            log.warning("could not fetch reports: %s", e)
+            return []
+
+
+# ------------------------------------------------------------------ helpers
+
+def fmt_dist(m: float) -> str:
+    return f"{round(m / 10) * 10:.0f} m" if m < 1000 else f"{m / 1000:.1f} km"
+
+
+def fmt_dur(s: float) -> str:
+    mins = round(s / 60)
+    return f"{mins} min" if mins < 60 else f"{mins // 60} h {mins % 60} min"
+
+
+def blockages_on(route: Route, reports: list[dict[str, Any]], start_idx: int = 0) -> list[dict[str, Any]]:
+    """Reports lying on the route (after start_idx), with distance along the route."""
+    hits = []
+    path = route.path
+    for rep in reports:
+        d, idx = distance_to_path((rep["lat"], rep["lng"]), path)
+        if d <= ON_ROUTE_M and idx >= start_idx:
+            hits.append({**rep, "along_m": path_length(path, start_idx, idx)})
+    return sorted(hits, key=lambda h: h["along_m"])
+
+
+def report_brief(rep: dict[str, Any], dist_m: float | None = None) -> dict[str, Any]:
+    return {
+        "what": rep["summary"],
+        "category": rep["category"],
+        "severity": rep["severity"],
+        "near": rep.get("locality") or None,
+        "distance": fmt_dist(dist_m) if dist_m is not None else None,
+        "confirmed_by_drivers": rep["confirms"],
+        "photo_checked_by_ai": rep.get("ai_verified"),
+    }
+
+
+async def detour_routes(maps: Maps, origin: LatLng, dest: LatLng, route: Route, block: dict[str, Any]) -> list[Route]:
+    """Try to route around a blockage by forcing a via-point off to each side of it."""
+    _, idx = distance_to_path((block["lat"], block["lng"]), route.path)
+    a, b = route.path[idx], route.path[min(idx + 1, len(route.path) - 1)]
+    brg = bearing(a, b) if a != b else 0.0
+    vias = [offset((block["lat"], block["lng"]), brg + side, dist) for dist in (600, 1200) for side in (90, -90)]
+    results = await asyncio.gather(*(maps.routes(origin, dest, via=v) for v in vias), return_exceptions=True)
+    return [r for res in results if isinstance(res, list) for r in res]
+
+
+# ------------------------------------------------------------------ agent
+
+class KenDrive(Agent):
+    def __init__(self, state: DriveState) -> None:
+        extra_tools = [function_tool(self.report_blockage)] if ROAD_REPORTS else []
+        super().__init__(instructions=INSTRUCTIONS, tools=extra_tools)
+        self.s = state
+
+    @function_tool
+    async def find_nearby(
+        self,
+        ctx: RunContext,
+        category: Literal[
+            "fuel", "ev_charging", "restaurant", "hospital", "parking", "atm", "pharmacy", "car_repair", "other"
+        ],
+        keyword: str | None = None,
+    ) -> dict[str, Any]:
+        """Find the closest places of a kind around the driver's current location.
+
+        Args:
+            category: Kind of place. Use "other" with a keyword for anything else.
+            keyword: Optional extra filter, e.g. "vegetarian", "Indian Oil", "24 hour", "Tata Power".
+        """
+        loc = self.s.location()
+        try:
+            places = await self.s.maps.nearby(loc, category, query=keyword, radius_m=6000, limit=5)
+        except MapsError as e:
+            raise ToolError(str(e)) from e
+        if not places:
+            return {"result": f"No {category} found within 6 km."}
+        await self.s.push_ui({"type": "places", "category": category, "places": places})
+        return {
+            "places": [
+                {
+                    "name": p["name"],
+                    "distance": fmt_dist(p["distance_m"]),
+                    "area": p["address"],
+                    "open_now": p["open_now"],
+                    "rating": p["rating"],
+                }
+                for p in places[:3]
+            ]
+        }
+
+    @function_tool
+    async def find_best_dish(self, ctx: RunContext, dish: str) -> dict[str, Any]:
+        """Find the best nearby place for a specific dish by reading Google reviews, Google's review
+        summaries and menu snippets from the web, and keeping only places that actually serve it.
+        Shows the results as cards on the driver's screen.
+
+        Args:
+            dish: The dish, as specific as possible, e.g. "bolognese pasta", "hyderabadi biryani".
+        """
+        loc = self.s.location()
+        area = await self.s.maps.locality(loc)
+        city = area.split(", ")[-1] if area else ""
+        try:
+            ranked = await best_places_for_dish(self.s.maps, loc, dish, city)
+        except MapsError as e:
+            raise ToolError(str(e)) from e
+        serving = [r for r in ranked if r["evidence"] in ("on_menu", "reviewed", "likely")]
+        if not serving:
+            return {"result": f"No place within 10 km clearly serves {dish}."}
+
+        await self.s.push_ui(
+            {
+                "type": "places",
+                "category": "restaurant",
+                "title": f"Best {dish} near you",
+                "places": [
+                    {k: v for k, v in r.items() if k not in ("reviews", "menu_snippets")} for r in serving[:5]
+                ],
+            }
+        )
+        return {
+            "dish": dish,
+            "ranked": [
+                {
+                    "name": r["name"],
+                    "distance": fmt_dist(r["distance_m"]),
+                    "rating": r["rating"],
+                    "evidence": r["evidence"],
+                    "proof": r["quote"],
+                    "proof_from": r["quote_source"],
+                    "why": r["why"],
+                    "open_now": r["open_now"],
+                }
+                for r in serving[:3]
+            ],
+        }
+
+    @function_tool
+    async def find_ev_chargers(
+        self,
+        ctx: RunContext,
+        along_route: bool = False,
+        fast_only: bool = False,
+        connector: Literal["any", "CCS2", "Type 2", "CHAdeMO", "GB/T", "Tesla"] = "any",
+        vehicle: Literal["car", "two_wheeler"] = "car",
+        range_km: float | None = None,
+    ) -> dict[str, Any]:
+        """Find EV charging stations with live free/busy ports (where the operator shares them),
+        connector types and charging power. Shows them as cards on the driver's screen.
+
+        Args:
+            along_route: Search along the active route instead of around the driver (reports detour).
+            fast_only: Only DC fast chargers (25 kW or more).
+            connector: Required connector type; "any" if the driver didn't say.
+            vehicle: "two_wheeler" for e-scooters/bikes (includes slow sockets); otherwise "car".
+            range_km: Remaining driving range in km, if the driver said (e.g. from battery %).
+        """
+        loc = self.s.location()
+        route = self.s.route if along_route else None
+        if along_route and not route:
+            along_route = False
+        try:
+            chargers = await find_chargers(
+                self.s.maps, loc,
+                route_path=route.path if route else None,
+                route_duration_s=route.duration_s if route else None,
+                vehicle=vehicle, connector=connector, fast_only=fast_only, range_km=range_km,
+            )
+        except MapsError as e:
+            raise ToolError(str(e)) from e
+        if not chargers:
+            return {"result": "No matching chargers found" + (" within your range." if range_km else " nearby.")}
+        title = "Chargers on your route" if route else ("Fast chargers nearby" if fast_only else "EV chargers nearby")
+        await self.s.push_ui({"type": "places", "category": "ev_charging", "title": title, "places": chargers})
+        return {
+            "searched": "along route" if route else "around you",
+            "chargers": [
+                {
+                    "name": c["name"],
+                    "status": c["status"],
+                    "free_ports": c["free_ports"],
+                    "total_ports": c["total_ports"],
+                    "max_kw": c["max_kw"],
+                    "connectors": c["tags"],
+                    "drive_min": c["drive_min"],
+                    "detour_min": c["detour_min"],
+                    "range_added_in_30_min_km": c["range_30min_km"],
+                    "open_now": c["open_now"],
+                }
+                for c in chargers[:3]
+            ],
+        }
+
+    @function_tool
+    async def find_parking(
+        self,
+        ctx: RunContext,
+        near: str | None = None,
+        preference: Literal["any", "free", "covered", "valet", "street"] = "any",
+    ) -> dict[str, Any]:
+        """Smart parking finder: the destination's own parking (valet/lot/street, and what reviewers say
+        about parking there) plus nearby parking lots and garages ranked by walking time, opening
+        status and rating. Shows them as cards.
+
+        Args:
+            near: Place to park near. Leave empty to use the active route's destination, or the driver's
+                current location if there is no route.
+            preference: What the driver asked for, e.g. "free", "covered" (garage), "valet", "street".
+        """
+        loc = self.s.location()
+        venue: dict[str, Any] | None = None
+        try:
+            if near:
+                venue = await self.s.maps.geocode(near, near=loc)
+            elif self.s.destination:
+                venue = self.s.destination
+            target = (venue["lat"], venue["lng"]) if venue else loc
+            lots = await find_parking(self.s.maps, target, preference=preference)
+            at_venue = await venue_parking(self.s.maps, venue["id"]) if venue and venue.get("id") else None
+        except MapsError as e:
+            raise ToolError(str(e)) from e
+        where = venue["name"] if venue else "you"
+        if lots:
+            await self.s.push_ui(
+                {"type": "places", "category": "parking", "title": f"Parking near {where}", "places": lots}
+            )
+        return {
+            "near": where,
+            "destination_parking": at_venue,
+            "nearby_parking": [
+                {
+                    "name": l["name"],
+                    "walk_min": l["walk_min"],
+                    "type": l["kind"],
+                    "options": l["options"],
+                    "open_now": l["open_now"],
+                    "rating": l["rating"],
+                }
+                for l in lots[:3]
+            ] or "No public parking listed within 1.2 km.",
+            "note": "No live occupancy data; don't promise free spots.",
+        }
+
+    @function_tool
+    async def plan_route(self, ctx: RunContext, destination: str) -> dict[str, Any]:
+        """Plan a driving route to a destination (avoiding roads other drivers reported as blocked, when enabled).
+        Shows the route on the driver's map and makes it the active route.
+
+        Args:
+            destination: Place name or address, e.g. "Koramangala", "Manipal Hospital Old Airport Road",
+                or the name of a place returned by find_nearby.
+        """
+        origin = self.s.location()
+        try:
+            dest = await self.s.maps.geocode(destination, near=origin)
+            routes = await self.s.maps.routes(origin, (dest["lat"], dest["lng"]))
+        except MapsError as e:
+            raise ToolError(str(e)) from e
+        if not routes:
+            raise ToolError("No drivable route found.")
+
+        reports = await self.s.reports()
+        fastest = min(routes, key=lambda r: r.duration_s)
+        fastest_blocks = blockages_on(fastest, reports)
+        clear = [r for r in routes if not blockages_on(r, reports)]
+        if not clear:
+            # Every suggested route passes a reported blockage – force a detour around the first one.
+            detours = await detour_routes(self.s.maps, origin, (dest["lat"], dest["lng"]), fastest, fastest_blocks[0])
+            clear = [r for r in detours if not blockages_on(r, reports)]
+        chosen = min(clear, key=lambda r: r.duration_s) if clear else fastest
+        rerouted_around = fastest_blocks if chosen is not fastest else []
+        blocks = blockages_on(chosen, reports)
+
+        self.s.route, self.s.destination = chosen, dest
+        others = [r for r in routes if r is not chosen][:2]
+        await self.s.push_ui(
+            {
+                "type": "route",
+                "destination": dest,
+                "chosen": chosen.to_ui(),
+                "alternatives": [r.to_ui() for r in others],
+                "blocked": [r for r in reports if any(b["id"] == r["id"] for b in rerouted_around + blocks)],
+            }
+        )
+
+        result: dict[str, Any] = {
+            "destination": f'{dest["name"]}, {dest["address"]}',
+            "eta": fmt_dur(chosen.duration_s),
+            "distance": fmt_dist(chosen.distance_m),
+            "route": chosen.summary,
+            "first_turns": chosen.steps[:3],
+        }
+        if chosen.traffic_delay_s is not None:
+            result["traffic_delay"] = fmt_dur(chosen.traffic_delay_s)
+        else:
+            result["note"] = "Live traffic data unavailable; ETA is free-flow."
+        if rerouted_around:
+            result["avoided_blockages"] = [report_brief(b) for b in rerouted_around]
+            result["extra_time_vs_blocked_route"] = fmt_dur(max(0, chosen.duration_s - fastest.duration_s))
+        if blocks:
+            result["warning_route_still_blocked"] = [report_brief(b, b["along_m"]) for b in blocks]
+        return result
+
+    @function_tool
+    async def check_road_conditions_ahead(self, ctx: RunContext) -> dict[str, Any]:
+        """Check congestion, blockages and events on the road ahead: live traffic delay on the active
+        route, today's local traffic news, and (when enabled) crowd-sourced driver reports."""
+        loc = self.s.location()
+        reports = await self.s.reports()
+        out: dict[str, Any] = {}
+
+        if self.s.route:
+            _, my_idx = distance_to_path(loc, self.s.route.path)
+            ahead = blockages_on(self.s.route, reports, start_idx=my_idx)
+            if ROAD_REPORTS:
+                out["on_your_route"] = [report_brief(b, b["along_m"]) for b in ahead] or "No driver reports on your route."
+            if self.s.route.traffic_delay_s is not None:
+                out["traffic_delay_on_route"] = fmt_dur(self.s.route.traffic_delay_s)
+            out["destination"] = self.s.destination["name"] if self.s.destination else None
+            if ahead:
+                out["suggestion"] = "Offer to reroute with plan_route to the same destination."
+        else:
+            hdg = self.s.heading()
+            nearby = []
+            for r in reports:
+                d = haversine(loc, (r["lat"], r["lng"]))
+                if d > NEARBY_ALERT_M:
+                    continue
+                if hdg is not None and d > 300:
+                    diff = abs((bearing(loc, (r["lat"], r["lng"])) - hdg + 180) % 360 - 180)
+                    if diff > 70:
+                        continue  # behind or well off to the side
+                nearby.append(report_brief(r, d))
+            if ROAD_REPORTS:
+                out["driver_reports_nearby"] = nearby or "No driver reports within 5 km ahead."
+            out["note"] = "No active route; set a destination for route-specific traffic."
+
+        area = await self.s.maps.locality(loc)
+        if area:
+            city = area.split(", ")[-1]
+            news = await ddgs_search(f"{city} traffic diversion procession road closed today", news=True,
+                                     max_results=10, timelimit="d")
+            names = {city.lower(), *CITY_ALIASES.get(city.lower(), ())}
+            relevant = [
+                n for n in news
+                if TRAFFIC_WORDS.intersection((text := f'{n["title"]} {n["snippet"] or ""}'.lower()).split())
+                and any(c in text for c in names)
+            ]
+            out["area"] = area
+            out["local_news"] = [{"title": n["title"], "snippet": (n["snippet"] or "")[:200]} for n in relevant[:4]] \
+                or "No traffic news for today."
+        if ROAD_REPORTS:
+            await self.s.push_ui({"type": "focus_reports"})
+        return out
+
+    # Registered in __init__ only when ROAD_REPORTS is on.
+    async def report_blockage(self, ctx: RunContext, description: str) -> dict[str, Any]:
+        """Report, hands-free, that the road at the driver's current location is blocked or congested.
+        The report is shared live with every other driver using the app.
+
+        Args:
+            description: What the driver sees, e.g. "Ganesha procession blocking the road".
+        """
+        lat, lng = self.s.location()
+        r = await self.s.http.post(
+            f"{API_BASE}/api/reports",
+            data={"lat": lat, "lng": lng, "note": description, "reporter": "voice",
+                  "heading": self.s.heading() or ""},
+        )
+        if r.status_code != 200:
+            raise ToolError("Could not submit the report right now.")
+        rep = r.json()
+        self.s.announced.add(rep["id"])  # don't alert the reporter about their own report
+        return {"reported": True, "area": rep.get("locality"), "shared_with": "all drivers"}
+
+    @function_tool
+    async def web_search(self, ctx: RunContext, query: str, news: bool = False) -> dict[str, Any]:
+        """Search the web with DuckDuckGo. Use for festivals, processions, road closures, diversions,
+        weather events, or any general question.
+
+        Args:
+            query: Search query. Include the city/area for local topics.
+            news: True for recent news (last few days) instead of general web results.
+        """
+        results = await ddgs_search(query, news=news, max_results=5, timelimit="w" if news else None)
+        if not results:
+            return {"results": "No results found."}
+        return {"results": [{"title": r["title"], "snippet": (r["snippet"] or "")[:300], "date": r.get("date")}
+                            for r in results]}
+
+    @function_tool
+    async def ask_google_maps(self, ctx: RunContext, question: str) -> dict[str, Any]:
+        """Ask Google Maps (Grounding Lite) about places: reviews, what a place is known for,
+        kid/family friendliness, specific dishes, facilities.
+
+        Args:
+            question: Natural-language question, e.g. "good South Indian breakfast near me with parking".
+        """
+        loc = self.s.location()
+        res = await self.s.maps.ask_maps(question, near=loc)
+        if res.get("places"):
+            await self.s.push_ui({"type": "places", "category": "other", "places": res["places"]})
+            res["places"] = [{"name": p["name"], "distance": fmt_dist(p["distance_m"]), "rating": p["rating"]}
+                             for p in res["places"][:3]]
+        return res
+
+    @function_tool
+    async def clear_route(self, ctx: RunContext) -> str:
+        """Cancel the active route / navigation."""
+        self.s.route = self.s.destination = None
+        await self.s.push_ui({"type": "clear_route"})
+        return "Route cleared."
+
+
+# ------------------------------------------------------------------ proactive alerts
+
+async def watch_reports(state: DriveState, session: AgentSession) -> None:
+    """Listen to the live report feed and warn the driver about new blockages that affect them."""
+    while True:
+        try:
+            async with state.http.stream("GET", f"{API_BASE}/api/events", timeout=None) as resp:
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    evt = json.loads(line[6:])
+                    rep = evt["report"]
+                    if evt["type"] != "report_added" or rep["id"] in state.announced:
+                        continue
+                    try:
+                        loc = state.location()
+                    except ToolError:
+                        continue
+                    on_route = state.route and blockages_on(state.route, [rep], distance_to_path(loc, state.route.path)[1])
+                    dist = haversine(loc, (rep["lat"], rep["lng"]))
+                    if not on_route and dist > NEARBY_ALERT_M:
+                        continue
+                    state.announced.add(rep["id"])
+                    where = "on your current route" if on_route else f"about {fmt_dist(dist)} away"
+                    session.generate_reply(
+                        instructions=(
+                            f"Proactively alert the driver in one or two sentences: another driver just reported "
+                            f"'{rep['summary']}' {where}"
+                            f"{' near ' + rep['locality'] if rep.get('locality') else ''}. "
+                            + ("Offer to find a way around it." if on_route else "")
+                        )
+                    )
+        except (httpx.HTTPError, json.JSONDecodeError) as e:
+            log.info("report feed disconnected (%s); retrying", e)
+        await asyncio.sleep(3)
+
+
+# ------------------------------------------------------------------ entrypoint
+
+server = AgentServer()
+
+
+@server.rtc_session(agent_name=AGENT_NAME)
+async def entrypoint(ctx: JobContext) -> None:
+    if not (GEMINI_API_KEY or os.getenv("GOOGLE_GENAI_USE_VERTEXAI")):
+        log.error("GOOGLE_API_KEY is empty – add a Gemini API key to .env and restart the agent")
+        await ctx.connect()
+        await ctx.room.local_participant.set_attributes({"kendrive.error": "missing_gemini_key"})
+        await asyncio.sleep(2)
+        ctx.shutdown(reason="missing GOOGLE_API_KEY")
+        return
+    await ctx.connect()
+    http = httpx.AsyncClient(timeout=20)
+    state = DriveState(room=ctx.room, maps=Maps(os.environ["GOOGLE_PLACES_API_KEY"]), http=http)
+
+    log.info("starting Gemini Live session with %s", GEMINI_LIVE_MODEL)
+    session = AgentSession(
+        llm=google.realtime.RealtimeModel(
+            model=GEMINI_LIVE_MODEL,
+            api_key=GEMINI_API_KEY,
+            voice=os.getenv("GEMINI_VOICE", "Puck"),
+        )
+    )
+
+    await session.start(room=ctx.room, agent=KenDrive(state))
+    watcher = asyncio.create_task(watch_reports(state, session)) if ROAD_REPORTS else None
+
+    async def cleanup() -> None:
+        if watcher:
+            watcher.cancel()
+        await http.aclose()
+        await state.maps.http.aclose()
+
+    ctx.add_shutdown_callback(cleanup)
+    session.generate_reply(
+        instructions="Greet the driver in one short sentence as KenDrive and say they can ask about fuel, "
+        "EV charging, food, hospitals, routes or traffic ahead."
+    )
+
+
+if __name__ == "__main__":
+    cli.run_app(server)
