@@ -84,6 +84,9 @@ Always use tools instead of guessing:
   words ("it's on their menu", "reviewers rave about the bolognese"). Never recommend a place whose
   evidence is "no".
 {routing_rules}
+- Weather ("what's the weather", "will it rain", "should I take my bike", "is it hot", "carry umbrella",
+  "foggy", "visibility") → get_weather. Lead with condition + temperature, then mention rain chance or
+  alerts if relevant. Keep it to two sentences max.
 - Local events, festivals, diversions, news, general questions → web_search.
 - Questions about a specific place (reviews, is it good, what's it known for) → ask_google_maps.
 For medical emergencies, give the nearest hospital and remind them to call an ambulance: 108 in
@@ -269,6 +272,26 @@ class KenDrive(Agent):
                 for p in places[:3]
             ]
         }
+
+    @function_tool
+    async def get_weather(self, ctx: RunContext) -> dict[str, Any]:
+        """Get the current weather and today's forecast at the driver's location.
+        Use this when the driver asks about weather, rain, temperature, visibility,
+        whether to take a motorbike, whether to carry an umbrella, or road conditions
+        due to weather (fog, heavy rain, storm alerts).
+        """
+        loc = self.s.location()
+        try:
+            r = await self.s.http.get(
+                f"{API_BASE}/api/weather",
+                params={"lat": loc[0], "lng": loc[1]},
+                timeout=10,
+            )
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            raise ToolError(f"Weather unavailable right now: {e}") from e
+        return data
 
     @function_tool
     async def find_best_dish(self, ctx: RunContext, dish: str) -> dict[str, Any]:

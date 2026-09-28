@@ -284,6 +284,43 @@ async def events(request: Request) -> StreamingResponse:
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 
+@app.get("/api/weather")
+async def weather(lat: float, lng: float) -> dict[str, Any]:
+    """Proxy to WeatherAPI.com — keeps the key server-side."""
+    key = os.getenv("WEATHERAPI_KEY")
+    if not key:
+        raise HTTPException(503, "WEATHERAPI_KEY not configured")
+    import httpx as _httpx
+    url = "https://api.weatherapi.com/v1/forecast.json"
+    params = {"key": key, "q": f"{lat},{lng}", "days": 1, "aqi": "no", "alerts": "yes"}
+    try:
+        async with _httpx.AsyncClient(timeout=8) as client:
+            r = await client.get(url, params=params)
+            r.raise_for_status()
+            data = r.json()
+    except Exception as e:
+        raise HTTPException(502, f"WeatherAPI error: {e}") from e
+
+    cur = data["current"]
+    day = data["forecast"]["forecastday"][0]["day"]
+    alerts = [a["headline"] for a in data.get("alerts", {}).get("alert", [])]
+    return {
+        "condition": cur["condition"]["text"],
+        "temp_c": cur["temp_c"],
+        "feelslike_c": cur["feelslike_c"],
+        "humidity": cur["humidity"],
+        "wind_kph": cur["wind_kph"],
+        "wind_dir": cur["wind_dir"],
+        "vis_km": cur["vis_km"],
+        "is_day": cur["is_day"],
+        "max_temp_c": day["maxtemp_c"],
+        "min_temp_c": day["mintemp_c"],
+        "chance_of_rain": day["daily_chance_of_rain"],
+        "will_rain": bool(day["daily_will_it_rain"]),
+        "alerts": alerts,
+    }
+
+
 @app.get("/")
 async def index() -> RedirectResponse:
     """The UI is the Next.js app in ./frontend (it proxies /api/* back here)."""
