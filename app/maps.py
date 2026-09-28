@@ -46,6 +46,7 @@ PLACE_FIELDS = [
     "userRatingCount",
     "currentOpeningHours.openNow",
     "googleMapsUri",
+    "websiteUri",
     "photos",
     "nationalPhoneNumber",
 ]
@@ -112,6 +113,7 @@ class Maps:
             "ratings": p.get("userRatingCount"),
             "open_now": p.get("currentOpeningHours", {}).get("openNow"),
             "maps_url": p.get("googleMapsUri"),
+            "website": p.get("websiteUri"),
             "phone": p.get("nationalPhoneNumber"),
             # Resource name only; the browser loads it through /api/place-photo so the key stays server-side.
             "photo": (p.get("photos") or [{}])[0].get("name"),

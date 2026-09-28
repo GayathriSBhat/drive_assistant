@@ -1,0 +1,50 @@
+# KenDrive: LiveKit server + API (FastAPI) + voice agent (LiveKit Agents, Gemini Live) + web app (Next.js).
+#
+#   cp .env.example .env        # fill in GOOGLE_PLACES_API_KEY and GEMINI_API_KEY
+#   docker compose up --build
+#   open http://localhost:3000   (?demo = Dubai demo location, ?demo=singapore = Singapore)
+#
+# This runs LiveKit in dev mode (keys devkey/secret) for local use. To deploy on a server, set
+# --node-ip to the server's public IP, open 7880-7882, and use LIVEKIT_PUBLIC_URL=wss://…
+services:
+  livekit:
+    image: livekit/livekit-server:v1.13.7
+    # Advertise 127.0.0.1 for media: the browser reaches it through the published ports, and the
+    # agent shares this container's network (see below), so 127.0.0.1 works for both.
+    command: ["--dev", "--bind", "0.0.0.0", "--node-ip", "127.0.0.1"]
+    ports:
+      - "7880:7880"     # signalling
+      - "7881:7881"     # WebRTC over TCP
+      - "7882:7882/udp" # WebRTC over UDP
+
+  api:
+    build: .
+    env_file: .env
+    environment:
+      LIVEKIT_PUBLIC_URL: ws://localhost:7880 # handed to the browser in /api/token
+      FRONTEND_URL: http://localhost:3000
+    volumes:
+      - ./data:/app/data # road reports + uploaded photos
+    ports:
+      - "8000:8000"
+
+  agent:
+    build: .
+    command: ["python", "agent.py", "start"]
+    env_file: .env
+    environment:
+      LIVEKIT_URL: ws://localhost:7880
+      API_BASE: http://api:8000
+    # Same network namespace as LiveKit, so the media address it advertises (127.0.0.1) is reachable.
+    network_mode: service:livekit
+    depends_on: [livekit, api]
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./frontend
+      args:
+        KENDRIVE_API_ORIGIN: http://api:8000
+    ports:
+      - "3000:3000"
+    depends_on: [api]

@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from .geo import LatLng
+from .geo import LatLng, haversine
 from .maps import PLACE_FIELDS, Maps
 
 # ------------------------------------------------------------------ EV chargers
@@ -290,6 +290,80 @@ async def find_parking(
             }
         )
     out.sort(key=lambda c: c["_score"])
-    for c in out:
-        c.pop("_score")
-    return out[:limit]
+    return out[:limit]  # "_score" is kept for merge_live(), which re-ranks and removes it
+
+
+# ------------------------------------------------------------------ live availability
+
+GENERIC_LOT_NAME = re.compile(r"^\W*(public\s+)?(car\s*)?park(ing)?(\s+(lot|area|garage|entrance))?\W*$", re.I)
+
+
+def _live_badge(free: int, total: int | None) -> dict[str, str]:
+    if free == 0:
+        return {"text": "Full · live", "tone": "bad"}
+    return {"text": f"{free}{f'/{total}' if total else ''} free · live", "tone": "good" if free >= 10 else "likely"}
+
+
+def _attach_live(lot: dict[str, Any], live: dict[str, Any]) -> None:
+    lot["live"] = {k: live.get(k) for k in ("free", "total", "updated", "source")}
+    lot["badge"] = _live_badge(live["free"], live.get("total"))
+    updated = live.get("updated")
+    extra = [f"Updated {updated[11:16]}" if updated and len(updated) >= 16 else "Live", *live.get("notes", [])]
+    lot["tags"] = list(dict.fromkeys([*(lot.get("tags") or [])[:1], *extra]))[:4]
+
+
+def merge_live(lots: list[dict[str, Any]], live: list[dict[str, Any]], limit: int = 6) -> list[dict[str, Any]]:
+    """Attach live counts to matching Google parking places, add car parks only the live feed
+    knows, and re-rank: walking time first, then availability (full car parks sink)."""
+    unused = list(live)
+    for lot in lots:
+        near = min(unused, key=lambda l: haversine((lot["lat"], lot["lng"]), (l["lat"], l["lng"])), default=None)
+        if near and haversine((lot["lat"], lot["lng"]), (near["lat"], near["lng"])) <= 80:
+            unused.remove(near)
+            _attach_live(lot, near)
+    for l in unused:
+        walk = max(1, round(l["distance_m"] * 1.25 / WALK_M_PER_MIN))
+        lot = {
+            "id": None, "name": l["name"], "address": l["source"], "lat": l["lat"], "lng": l["lng"],
+            "distance_m": l["distance_m"], "rating": None, "ratings": None, "open_now": None, "phone": None,
+            "photo": None, "website": None,
+            "maps_url": f"https://www.google.com/maps/search/?api=1&query={l['lat']:.6f},{l['lng']:.6f}",
+            "walk_min": walk, "kind": l.get("kind") or "Car park", "options": [], "tags": [l.get("kind") or "Car park"],
+            "_score": walk,
+        }
+        _attach_live(lot, l)
+        lots.append(lot)
+    for lot in lots:
+        live_info = lot.get("live")
+        if live_info:
+            free = live_info["free"]
+            lot["_score"] += 0 if free >= 10 else 2 if free > 0 else 25
+        elif live:
+            lot["_score"] += 3  # the city has live data but not for this one
+    lots.sort(key=lambda c: c["_score"])
+    for lot in lots:
+        lot.pop("_score", None)
+    return lots[:limit]
+
+
+def worth_checking_online(lot: dict[str, Any]) -> bool:
+    """Named car parks (or ones with a website) are worth a web search; 'Parking Lot' isn't."""
+    name = lot["name"] or ""
+    named = re.search(r"[A-Za-z]", name) and not GENERIC_LOT_NAME.match(name)
+    return not lot.get("live") and (bool(lot.get("website")) or bool(named))
+
+
+def apply_online(lot: dict[str, Any], online: dict[str, Any] | None) -> None:
+    """Fold a web check into a car-park card: live counts if published, else rates / where to see live."""
+    if not online:
+        return
+    lot["online"] = online
+    if online.get("live_counts_found") and online.get("free_spaces") is not None:
+        lot["badge"] = _live_badge(int(online["free_spaces"]), online.get("total_spaces"))
+    elif online.get("live_available_via"):
+        lot["tags"] = list(dict.fromkeys([*(lot.get("tags") or []), "Live count in app"]))[:4]
+    facts = "; ".join(x for x in (online.get("free_parking"), online.get("rates")) if x)
+    if facts:
+        lot["quote"], lot["quote_source"] = facts[:220], "web"
+    if online.get("source_url"):
+        lot["website"] = online["source_url"]

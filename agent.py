@@ -24,7 +24,16 @@ from livekit.plugins import google
 
 from app.geo import LatLng, bearing, distance_to_path, haversine, offset, path_length
 from app.dish import best_places_for_dish
-from app.ev_parking import find_chargers, find_parking, venue_parking
+from app.ev_parking import (
+    apply_online,
+    find_chargers,
+    find_parking,
+    merge_live,
+    venue_parking,
+    worth_checking_online,
+)
+from app.parking_live import coverage, live_lots_near
+from app.parking_web import check_parking_online
 from app.maps import Maps, MapsError, Route
 from app.search import web_search as ddgs_search
 
@@ -47,10 +56,13 @@ TRAFFIC_WORDS = {"traffic", "jam", "diversion", "diversions", "diverted", "proce
 CITY_ALIASES = {"bengaluru": ("bangalore",), "mumbai": ("bombay",), "chennai": ("madras",), "kolkata": ("calcutta",),
                 "gurugram": ("gurgaon",)}
 
-INSTRUCTIONS = """You are KenDrive, a voice co-pilot for someone who is DRIVING right now (India or the UAE).
+INSTRUCTIONS = """You are a voice co-pilot for someone who is DRIVING right now (India or the UAE).
 Style: calm, brief, spoken. One to three short sentences. No lists, no markdown, no URLs, no
 coordinates. Round distances ("about 800 metres", "2.4 kilometres") and times ("12 minutes").
-The driver may start with "Hey KenDrive" — that's just your wake phrase; answer the question.
+When the session starts, greet the driver with: "Hello, I'm your driving assistant. Where would you like to go today, or can I help you find something nearby?"
+The driver may ask about parking, fuel, EV charging, food, routes or traffic ahead.
+Only ever say words meant for the driver. Never read out instructions, plans, steps, tool names or
+parameters — call the tool silently, then tell the driver the result.
 Understand local usage: "petrol bunk" = fuel station, "signal" = traffic light, "Salik" = Dubai toll gate.
 
 Always use tools instead of guessing:
@@ -58,9 +70,12 @@ Always use tools instead of guessing:
   or range, pass range_km. If a route is active and they want one "on the way", set along_route.
   Lead with the best option: name, how many ports are free (or that status is unknown), power, and
   how long to get there; mention how much range 30 minutes adds.
-- Parking ("where can I park", "parking near X") → find_parking. By default it looks near the active
-  destination. Mention the destination's own parking first (valet/lot) and any reviewer warnings,
-  then the best nearby option with walking time. Never claim a spot is free — there is no live data.
+- Parking ("where can I park", "parking near X", "is there space at …") → find_parking. By default it
+  looks near the active destination. Say you're checking live availability first. If live numbers exist
+  (a car park's "live", live_api, or online.live_counts_found), lead with them ("Seng Poh Lane has 96 free
+  spaces right now, a 2-minute walk"). If not, say live counts aren't published online and where the
+  driver can see them (online.live_available_via, e.g. the Dubai Mall app), then give the best option with
+  walking time and the free-parking rule. Never invent or guess space numbers.
   After plan_route to a busy place (mall, restaurant, downtown), offer to find parking.
 - Fuel, restaurants, hospitals, ATMs, pharmacies, mechanics → find_nearby.
 - "Where do I get the best / good <dish>?" (e.g. best pasta, bolognese, biryani, filter coffee) →
@@ -183,6 +198,32 @@ async def detour_routes(maps: Maps, origin: LatLng, dest: LatLng, route: Route, 
     vias = [offset((block["lat"], block["lng"]), brg + side, dist) for dist in (600, 1200) for side in (90, -90)]
     results = await asyncio.gather(*(maps.routes(origin, dest, via=v) for v in vias), return_exceptions=True)
     return [r for res in results if isinstance(res, list) for r in res]
+
+
+def destination_parking_card(venue: dict[str, Any], at_venue: dict[str, Any] | None,
+                             online: dict[str, Any] | None) -> dict[str, Any]:
+    """First card for the destination's own parking: live count if published, else where to see it."""
+    online = online or {}
+    if online.get("live_counts_found") and online.get("free_spaces") is not None:
+        badge = {"text": f"{online['free_spaces']} free · live", "tone": "good" if online["free_spaces"] else "bad"}
+    elif online.get("live_available_via"):
+        badge = {"text": "Live count in app", "tone": "neutral"}
+    else:
+        badge = {"text": "No live count online", "tone": "neutral"}
+    facts = "; ".join(x for x in (online.get("free_parking"), online.get("capacity"), online.get("rates")) if x)
+    reviewers = (at_venue or {}).get("what_reviewers_say") or []
+    return {
+        **venue,
+        "pinned": True,  # shown first as "Destination", not ranked against the car parks
+        "name": f"{venue['name']} parking",
+        "distance_m": 0,
+        "walk_min": 0,
+        "badge": badge,
+        "tags": ((at_venue or {}).get("options") or [])[:3],
+        "quote": facts[:220] if facts else (reviewers[0][:200] if reviewers else None),
+        "quote_source": "web" if facts else "review" if reviewers else None,
+        "website": online.get("source_url") or venue.get("website"),
+    }
 
 
 # ------------------------------------------------------------------ agent
@@ -339,9 +380,10 @@ class KenDrive(Agent):
         near: str | None = None,
         preference: Literal["any", "free", "covered", "valet", "street"] = "any",
     ) -> dict[str, Any]:
-        """Smart parking finder: the destination's own parking (valet/lot/street, and what reviewers say
-        about parking there) plus nearby parking lots and garages ranked by walking time, opening
-        status and rating. Shows them as cards.
+        """Smart parking finder with live availability where it exists. Combines: nearby car parks
+        (Google Places), live free-space counts from open city APIs (e.g. Singapore), and a web search
+        of the destination and named car parks that reads their websites for live counts, rates and
+        free-parking rules. Shows the results as cards. Takes ~10 s — tell the driver you're checking.
 
         Args:
             near: Place to park near. Leave empty to use the active route's destination, or the driver's
@@ -356,18 +398,61 @@ class KenDrive(Agent):
             elif self.s.destination:
                 venue = self.s.destination
             target = (venue["lat"], venue["lng"]) if venue else loc
-            lots = await find_parking(self.s.maps, target, preference=preference)
-            at_venue = await venue_parking(self.s.maps, venue["id"]) if venue and venue.get("id") else None
+            lots, live, area, at_venue = await asyncio.gather(
+                find_parking(self.s.maps, target, preference=preference),
+                live_lots_near(self.s.http, target),
+                self.s.maps.locality(target),
+                venue_parking(self.s.maps, venue["id"]) if venue and venue.get("id") else asyncio.sleep(0),
+            )
         except MapsError as e:
             raise ToolError(str(e)) from e
+        lots = merge_live(lots, live)
+        city = area.split(", ")[-1] if area else ""
+
+        # Web-check the destination and the top named car parks, in parallel, within a time budget.
+        async def online(name: str, website: str | None) -> dict[str, Any] | None:
+            try:
+                return await asyncio.wait_for(check_parking_online(self.s.http, name, city, website), 18)
+            except (asyncio.TimeoutError, httpx.HTTPError) as e:
+                log.info("web parking check for %s gave up: %s", name, e)
+                return None
+
+        to_check = [l for l in lots if worth_checking_online(l)][:2]
+        checks = await asyncio.gather(
+            online(venue["name"], venue.get("website")) if venue else asyncio.sleep(0),
+            *(online(l["name"], l.get("website")) for l in to_check),
+        )
+        venue_online, lot_checks = checks[0], checks[1:]
+        for lot, result in zip(to_check, lot_checks):
+            apply_online(lot, result)
+
         where = venue["name"] if venue else "you"
-        if lots:
+        cards = list(lots)
+        if venue:
+            cards.insert(0, destination_parking_card(venue, at_venue, venue_online))
+        if cards:
             await self.s.push_ui(
-                {"type": "places", "category": "parking", "title": f"Parking near {where}", "places": lots}
+                {"type": "places", "category": "parking", "title": f"Parking near {where}", "places": cards}
             )
+
+        def brief_online(o: dict[str, Any] | None) -> dict[str, Any] | None:
+            if not o:
+                return None
+            keys = ("live_counts_found", "free_spaces", "total_spaces", "zones", "as_of", "live_available_via",
+                    "capacity", "rates", "free_parking", "tips", "source_url")
+            return {k: o.get(k) for k in keys if o.get(k) not in (None, [], "")}
+
         return {
             "near": where,
-            "destination_parking": at_venue,
+            "destination_parking": {**(at_venue or {}), "online": brief_online(venue_online)} if venue else None,
+            "live_api": {
+                "coverage": coverage(target) or "No open live-parking feed covers this city.",
+                "car_parks": [
+                    {"name": l["name"], "free": l["free"], "total": l["total"], "distance_m": l["distance_m"],
+                     "updated": l["updated"]}
+                    for l in live[:5]
+                ],
+            },
             "nearby_parking": [
                 {
                     "name": l["name"],
@@ -375,11 +460,13 @@ class KenDrive(Agent):
                     "type": l["kind"],
                     "options": l["options"],
                     "open_now": l["open_now"],
-                    "rating": l["rating"],
+                    "live": l.get("live"),
+                    "online": brief_online(l.get("online")),
                 }
                 for l in lots[:3]
             ] or "No public parking listed within 1.2 km.",
-            "note": "No live occupancy data; don't promise free spots.",
+            "note": "Quote free-space numbers ONLY from 'live' / live_api / online.live_counts_found. "
+                    "Otherwise say no live count is published and where it can be seen (live_available_via).",
         }
 
     @function_tool
@@ -617,6 +704,13 @@ async def entrypoint(ctx: JobContext) -> None:
         )
     )
 
+    # Transcripts aren't shown in the UI, so keep the conversation in the agent log.
+    @session.on("conversation_item_added")
+    def _log_turn(ev) -> None:
+        text = getattr(ev.item, "text_content", None)
+        if text:
+            log.info("%s: %s", getattr(ev.item, "role", "?"), text)
+
     await session.start(room=ctx.room, agent=KenDrive(state))
     watcher = asyncio.create_task(watch_reports(state, session)) if ROAD_REPORTS else None
 
@@ -627,10 +721,9 @@ async def entrypoint(ctx: JobContext) -> None:
         await state.maps.http.aclose()
 
     ctx.add_shutdown_callback(cleanup)
-    session.generate_reply(
-        instructions="Greet the driver in one short sentence as KenDrive and say they can ask about fuel, "
-        "EV charging, food, hospitals, routes or traffic ahead."
-    )
+    # Greeting comes from the system instructions. (Passing instructions= here makes the plugin inject
+    # them as a *model* turn, which Gemini 3.x Live can read back aloud as its own "plan".)
+    session.generate_reply()
 
 
 if __name__ == "__main__":
