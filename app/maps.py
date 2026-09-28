@@ -205,7 +205,9 @@ class Maps:
 
     async def place_details(self, place_id: str, fields: list[str]) -> dict[str, Any]:
         r = await self.http.get(
-            f"{PLACES_URL}/{place_id}", params={"fields": ",".join(fields), "key": self.api_key}
+            f"{PLACES_URL}/{place_id}",
+            params={"fields": ",".join(fields)},
+            headers={"X-Goog-Api-Key": self.api_key},
         )
         if r.status_code != 200:
             raise MapsError(f"Place details failed: {r.status_code} {r.text[:200]}")
@@ -248,7 +250,8 @@ class Maps:
         """Resolve a Places photo resource name to a short-lived, key-less googleusercontent URL."""
         r = await self.http.get(
             f"https://places.googleapis.com/v1/{photo_name}/media",
-            params={"maxWidthPx": max_width, "skipHttpRedirect": "true", "key": self.api_key},
+            params={"maxWidthPx": max_width, "skipHttpRedirect": "true"},
+            headers={"X-Goog-Api-Key": self.api_key},
         )
         if r.status_code != 200:
             raise MapsError(f"Place photo failed: {r.status_code}")

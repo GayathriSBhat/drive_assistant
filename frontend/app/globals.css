@@ -274,6 +274,11 @@ button { font: inherit; color: inherit; cursor: pointer; }
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5); animation: drop 0.35s ease-out;
 }
 .toast.info { background: #13233a; border-color: rgba(59, 130, 246, 0.5); color: #d6e7ff; }
+.toast:has(.toast-action) { display: flex; align-items: center; gap: 12px; }
+.toast-action {
+  flex: none; margin-left: auto; padding: 7px 12px; border-radius: 10px; border: 0;
+  background: var(--accent); color: #fff; font: inherit; font-weight: 600; cursor: pointer;
+}
 
 @keyframes blink { 50% { opacity: 0.3; } }
 @keyframes flash { 0% { box-shadow: 0 0 0 2px var(--accent), 0 0 30px rgba(59, 130, 246, 0.6); } 100% { box-shadow: 0 -12px 40px rgba(0, 0, 0, 0.45); } }

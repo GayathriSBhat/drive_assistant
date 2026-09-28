@@ -44,12 +44,24 @@ interface Toast {
   text: string;
   kind: "info" | "danger";
   id: number;
+  action?: { label: string; run: () => void };
 }
+
+const gpsSupported = () => window.isSecureContext && "geolocation" in navigator;
 
 function initialLocMode(): LocMode {
   const demo = new URLSearchParams(location.search).get("demo");
   if (demo !== null) return demo === "singapore" ? "singapore" : "dubai";
-  return window.isSecureContext && "geolocation" in navigator ? "gps" : "dubai";
+  return gpsSupported() ? "gps" : "dubai";
+}
+
+// "denied" means the browser won't show the prompt again; the driver has to allow it in site settings.
+async function gpsPermission(): Promise<PermissionState | "unknown"> {
+  try {
+    return (await navigator.permissions.query({ name: "geolocation" })).state;
+  } catch {
+    return "unknown";
+  }
 }
 
 export default function KenDriveApp() {
@@ -88,12 +100,12 @@ export default function KenDriveApp() {
     liveRef.current = live;
   }, [live]);
 
-  const showToast = useCallback((msg: string, kind: Toast["kind"] = "info") => {
-    setToast({ text: msg, kind, id: Date.now() });
+  const showToast = useCallback((msg: string, kind: Toast["kind"] = "info", action?: Toast["action"]) => {
+    setToast({ text: msg, kind, id: Date.now(), action });
   }, []);
   useEffect(() => {
     if (!toast) return;
-    const t = setTimeout(() => setToast(null), 6000);
+    const t = setTimeout(() => setToast(null), toast.action ? 12000 : 6000);
     return () => clearTimeout(t);
   }, [toast]);
 
@@ -114,6 +126,26 @@ export default function KenDriveApp() {
   const refreshMap = useCallback(() => mapRef.current?.refresh(locRef.current), []);
 
   // ---------------------------------------------------------------- location (GPS or demo)
+  // Falls back to the Dubai demo location, with a button to ask for GPS again.
+  const gpsFallback = useCallback(
+    async (reason: "timeout" | "error") => {
+      setLocMode("dubai");
+      if (!gpsSupported()) {
+        showToast("GPS needs HTTPS — using the Dubai demo location.");
+        return;
+      }
+      const retry = { label: "Use GPS", run: () => setLocMode("gps") };
+      if (reason === "timeout") {
+        showToast("Couldn't get a GPS fix — using the Dubai demo location.", "info", retry);
+      } else if ((await gpsPermission()) === "denied") {
+        showToast("Location is blocked — allow it for this site in your browser settings, then tap Use GPS.", "info", retry);
+      } else {
+        showToast("No location access — using the Dubai demo location.", "info", retry);
+      }
+    },
+    [showToast],
+  );
+
   useEffect(() => {
     if (locMode === "sim") return; // the simulator drives the location
     if (locMode !== "gps") {
@@ -122,11 +154,8 @@ export default function KenDriveApp() {
     }
     let gotFix = false;
     const fallback = setTimeout(() => {
-      if (!gotFix) {
-        showToast("Couldn't get GPS — using the Dubai demo location.");
-        setLocMode("dubai");
-      }
-    }, 8000);
+      if (!gotFix) void gpsFallback("timeout");
+    }, 10000);
     const id = navigator.geolocation.watchPosition(
       (pos) => {
         const first = !gotFix;
@@ -139,10 +168,7 @@ export default function KenDriveApp() {
       },
       () => {
         clearTimeout(fallback);
-        if (!gotFix) {
-          showToast("Location blocked — using the Dubai demo location.");
-          setLocMode("dubai");
-        }
+        if (!gotFix) void gpsFallback("error");
       },
       { enableHighAccuracy: true, maximumAge: 5000 },
     );
@@ -150,7 +176,7 @@ export default function KenDriveApp() {
       clearTimeout(fallback);
       navigator.geolocation.clearWatch(id);
     };
-  }, [locMode, showToast]);
+  }, [locMode, gpsFallback]);
 
   const where = `Driving tracker · ${locMode === "gps" ? "live GPS" : locMode === "sim" ? "simulated drive" : DEMO[locMode].label}`;
 
@@ -353,7 +379,8 @@ export default function KenDriveApp() {
         locMode={locMode}
         onLocMode={(m) => {
           stopSim();
-          setLocMode(m);
+          if (m === "gps" && !gpsSupported()) void gpsFallback("error");
+          else setLocMode(m);
         }}
         canSimulate={!!route}
         simulating={simulating}
@@ -428,6 +455,18 @@ export default function KenDriveApp() {
       {toast && (
         <div className={`toast ${toast.kind}`} key={toast.id} role="status">
           {toast.text}
+          {toast.action && (
+            <button
+              className="toast-action"
+              onClick={() => {
+                const { run } = toast.action!;
+                setToast(null);
+                run();
+              }}
+            >
+              {toast.action.label}
+            </button>
+          )}
         </div>
       )}
 

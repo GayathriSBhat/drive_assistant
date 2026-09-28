@@ -18,4 +18,5 @@ COPY agent.py server.py ./
 
 ENV PATH="/app/.venv/bin:$PATH"
 EXPOSE 8000
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
+# Shell form so $PORT (set by Railway) expands; "::" listens on IPv4 + IPv6 (Railway private networking).
+CMD ["sh", "-c", "exec uvicorn server:app --host :: --port ${PORT:-8000}"]
