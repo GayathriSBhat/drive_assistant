@@ -18,5 +18,6 @@ COPY agent.py server.py ./
 
 ENV PATH="/app/.venv/bin:$PATH"
 EXPOSE 8000
-# Shell form so $PORT (set by Railway) expands; "::" listens on IPv4 + IPv6 (Railway private networking).
-CMD ["sh", "-c", "exec uvicorn server:app --host :: --port ${PORT:-8000}"]
+# Shell form so $PORT (set by Railway) expands. --host '' binds IPv4 *and* IPv6: Railway's health check
+# uses IPv4, private networking uses IPv6, and "::" alone is IPv6-only under asyncio (IPV6_V6ONLY).
+CMD ["sh", "-c", "exec uvicorn server:app --host '' --port ${PORT:-8000}"]
