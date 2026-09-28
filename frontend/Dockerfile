@@ -10,7 +10,10 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 # Where /api/* is proxied to. Rewrites are resolved at build time, so this is a build arg.
 ARG KENDRIVE_API_ORIGIN=http://api:8000
+# Browser key for the Maps JavaScript API (restrict it to your domains). Optional: without it the map card stays hidden.
+ARG NEXT_PUBLIC_GOOGLE_MAPS_KEY=""
 ENV KENDRIVE_API_ORIGIN=$KENDRIVE_API_ORIGIN \
+    NEXT_PUBLIC_GOOGLE_MAPS_KEY=$NEXT_PUBLIC_GOOGLE_MAPS_KEY \
     NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 

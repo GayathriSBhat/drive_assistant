@@ -1,60 +1,97 @@
-import L from "leaflet";
-import { decodePolyline, esc, fmtDist } from "./format";
+/// <reference types="google.maps" />
+import { decodePolyline } from "./format";
 import type { LatLng, Loc, Place, RouteEvent } from "./types";
 
 const CATEGORY_COLORS: Record<string, string> = {
-  fuel: "#ffb020",
+  fuel: "#e8935c",
   ev_charging: "#3ecf8e",
   restaurant: "#ff7a45",
   hospital: "#ff4f6d",
-  parking: "#3b82f6",
+  parking: "#6b8afd",
   atm: "#8a7dff",
   pharmacy: "#33d6c2",
   car_repair: "#9aa5b1",
-  other: "#3b82f6",
+  other: "#edaa57",
+};
+
+// Browser key for the Maps JavaScript API (restrict it to your domains). Inlined at build time.
+const MAPS_KEY = process.env.NEXT_PUBLIC_GOOGLE_MAPS_KEY ?? "";
+
+let loading: Promise<void> | null = null;
+
+/** Loads the Maps JavaScript API once (async loader + importLibrary). */
+function loadGoogleMaps(): Promise<void> {
+  if (loading) return loading;
+  loading = new Promise((resolve, reject) => {
+    if (!MAPS_KEY) return reject(new Error("NEXT_PUBLIC_GOOGLE_MAPS_KEY is not set"));
+    const w = window as unknown as Record<string, unknown>;
+    w.__kendriveMapsReady = () => resolve();
+    const s = document.createElement("script");
+    s.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(MAPS_KEY)}&v=weekly&loading=async&libraries=marker&callback=__kendriveMapsReady`;
+    s.async = true;
+    s.onerror = () => reject(new Error("Couldn't load Google Maps"));
+    document.head.appendChild(s);
+  });
+  return loading;
+}
+
+const el = (html: string) => {
+  const d = document.createElement("div");
+  d.innerHTML = html;
+  return d.firstElementChild as HTMLElement;
 };
 
 /**
- * Imperative Leaflet wrapper: the driver's dot, result pins, the route and map framing.
- * `bottomOverlay` reports how much of the map's bottom is covered (results carousel / route card)
- * so fitted pins stay visible.
+ * Imperative Google Maps wrapper: the driver's dot, result pins, the route and map framing.
+ * Normal roadmap in Google's dark colour scheme; pins are HTML (AdvancedMarkerElement).
+ * Tapping a pin calls `onPinClick(index)` so the matching card can scroll into view.
  */
 export class MapController {
-  readonly map: L.Map;
-  private readonly me: L.Marker;
-  private readonly places = L.layerGroup();
-  private readonly route = L.layerGroup();
-  private placeMarkers: L.Marker[] = [];
+  private me: google.maps.marker.AdvancedMarkerElement | null = null;
+  private placeMarkers: google.maps.marker.AdvancedMarkerElement[] = [];
+  private routeLayers: (google.maps.Polyline | google.maps.marker.AdvancedMarkerElement)[] = [];
   private lastFit: LatLng[] | null = null;
 
-  constructor(el: HTMLElement, center: LatLng, private readonly bottomOverlay: () => number) {
-    this.map = L.map(el, { zoomControl: false }).setView(center, 14);
-    this.map.attributionControl.setPosition("topright"); // the bottom holds the results carousel
-    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      maxZoom: 19,
-      className: "dark-tiles",
-      attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> · Places © Google',
-    }).addTo(this.map);
-    this.places.addTo(this.map);
-    this.route.addTo(this.map);
-    this.me = L.marker(center, {
-      icon: L.divIcon({ className: "", html: '<div class="me-dot"></div>', iconSize: [18, 18] }),
-      zIndexOffset: 1000,
+  private constructor(
+    readonly map: google.maps.Map,
+    private readonly onPinClick: (index: number) => void,
+  ) {}
+
+  static async create(host: HTMLElement, center: LatLng, onPinClick: (index: number) => void): Promise<MapController> {
+    await loadGoogleMaps();
+    const { Map } = (await google.maps.importLibrary("maps")) as google.maps.MapsLibrary;
+    await google.maps.importLibrary("marker");
+    const map = new Map(host, {
+      center: { lat: center[0], lng: center[1] },
+      zoom: 14,
+      mapId: "DEMO_MAP_ID", // required for HTML markers; DARK below styles the normal roadmap
+      colorScheme: google.maps.ColorScheme.DARK,
+      mapTypeId: "roadmap",
+      disableDefaultUI: true,
+      clickableIcons: false,
+      gestureHandling: "greedy",
+      keyboardShortcuts: false,
     });
+    return new MapController(map, onPinClick);
   }
 
   destroy() {
-    this.map.remove();
+    this.clearPlaces();
+    this.clearRoute();
+    if (this.me) this.me.map = null;
   }
 
   setMe(loc: Loc, center = false) {
-    this.me.setLatLng([loc.lat, loc.lng]);
-    if (!this.map.hasLayer(this.me)) this.me.addTo(this.map);
-    if (center) this.map.setView([loc.lat, loc.lng], 15);
-  }
-
-  panTo(loc: Loc) {
-    this.map.panTo([loc.lat, loc.lng], { animate: true });
+    const position = { lat: loc.lat, lng: loc.lng };
+    if (!this.me) {
+      this.me = new google.maps.marker.AdvancedMarkerElement({ position, content: el('<div class="me-dot"></div>'), zIndex: 1000 });
+    }
+    this.me.position = position;
+    this.me.map = this.map;
+    if (center) {
+      this.map.setCenter(position);
+      this.map.setZoom(15);
+    }
   }
 
   showPlaces(places: Place[], category: string, me: Loc | null) {
@@ -64,23 +101,14 @@ export class MapController {
     places.forEach((p, i) => {
       if (p.lat == null || p.lng == null) return;
       const label = p.pinned ? "★" : i - pinned + 1; // numbers match the card ranks
-      const m = L.marker([p.lat, p.lng], {
-        icon: L.divIcon({
-          className: "",
-          html: `<div class="place-pin" style="background:${color}"><span>${label}</span></div>`,
-          iconSize: [28, 28],
-          iconAnchor: [14, 28],
-        }),
+      const m = new google.maps.marker.AdvancedMarkerElement({
+        map: this.map,
+        position: { lat: p.lat, lng: p.lng },
+        content: el(`<div class="place-pin" style="--pin:${color}"><span>${label}</span></div>`),
+        title: p.name,
+        gmpClickable: true,
       });
-      const open =
-        p.open_now == null ? "" : p.open_now ? ' · <span style="color:var(--ok)">Open</span>' : ' · <span style="color:var(--danger)">Closed</span>';
-      m.bindPopup(`
-        <h3>${esc(p.name)}</h3>
-        <div class="muted">${esc(p.address)}</div>
-        <div class="muted">${fmtDist(p.distance_m)}${p.rating ? ` · ★ ${p.rating}` : ""}${open}</div>
-        ${p.maps_url ? `<div class="muted" style="margin-top:4px"><a href="${esc(p.maps_url)}" target="_blank" rel="noopener">View on Google Maps</a></div>` : ""}
-        <div class="row"><button class="go" data-go="${esc(p.name)}, ${esc(p.address)}">Navigate</button></div>`);
-      this.places.addLayer(m);
+      m.addListener("click", () => this.onPinClick(i));
       this.placeMarkers[i] = m;
     });
     const pts: LatLng[] = places.filter((p) => p.lat != null && p.lng != null).map((p) => [p.lat!, p.lng!]);
@@ -89,55 +117,71 @@ export class MapController {
   }
 
   clearPlaces() {
-    this.places.clearLayers();
+    for (const m of this.placeMarkers) if (m) m.map = null;
     this.placeMarkers = [];
   }
 
   /** Draws the chosen route (plus greyed alternatives) and returns its path. */
   showRoute(evt: RouteEvent): LatLng[] {
-    this.route.clearLayers();
-    for (const alt of evt.alternatives) {
-      L.polyline(decodePolyline(alt.polyline), { color: "#5b6677", weight: 5, opacity: 0.7 }).addTo(this.route);
-    }
+    this.clearRoute();
+    const line = (pts: LatLng[], color: string, weight: number, opacity = 1, zIndex = 1) =>
+      new google.maps.Polyline({
+        map: this.map,
+        path: pts.map(([lat, lng]) => ({ lat, lng })),
+        strokeColor: color,
+        strokeWeight: weight,
+        strokeOpacity: opacity,
+        zIndex,
+      });
+    for (const alt of evt.alternatives) this.routeLayers.push(line(decodePolyline(alt.polyline), "#3a3c42", 5, 0.8));
     const path = decodePolyline(evt.chosen.polyline);
-    L.polyline(path, { color: "#0b0f14", weight: 10, opacity: 0.9 }).addTo(this.route);
-    L.polyline(path, { color: "#4f9dff", weight: 6 }).addTo(this.route);
+    this.routeLayers.push(line(path, "#08090a", 10, 0.9, 2), line(path, "#edaa57", 6, 1, 3));
     const d = evt.destination;
-    L.marker([d.lat, d.lng], { icon: L.divIcon({ className: "", html: '<div class="dest-pin"></div>', iconSize: [16, 16] }) })
-      .bindPopup(`<h3>${esc(d.name)}</h3><div class="muted">${esc(d.address)}</div>`)
-      .addTo(this.route);
+    this.routeLayers.push(
+      new google.maps.marker.AdvancedMarkerElement({
+        map: this.map,
+        position: { lat: d.lat, lng: d.lng },
+        content: el('<div class="dest-pin"></div>'),
+        title: d.name,
+      }),
+    );
     this.clearPlaces();
     this.lastFit = path;
     return path;
   }
 
   clearRoute() {
-    this.route.clearLayers();
+    for (const l of this.routeLayers) {
+      if (l instanceof google.maps.Polyline) l.setMap(null);
+      else l.map = null;
+    }
+    this.routeLayers = [];
   }
 
   setFit(pts: LatLng[] | null) {
     this.lastFit = pts;
   }
 
-  /** After the drawer resizes: tell Leaflet, then re-frame whatever is on show. */
+  /** After the card resizes: re-frame whatever is on show (clear of the title bar at the top). */
   refresh(me: Loc | null) {
-    this.map.invalidateSize();
-    if (this.map.getSize().y < 60) return; // drawer peeking: nothing visible to frame
     if (this.lastFit?.length) {
-      this.map.fitBounds(L.latLngBounds(this.lastFit), {
-        paddingTopLeft: [16, 16],
-        paddingBottomRight: [16, this.bottomOverlay() + 16],
-        maxZoom: 16,
-      });
+      const b = new google.maps.LatLngBounds();
+      for (const [lat, lng] of this.lastFit) b.extend({ lat, lng });
+      this.map.fitBounds(b, { top: 72, left: 24, right: 24, bottom: 24 });
+      if ((this.map.getZoom() ?? 0) > 16) this.map.setZoom(16);
     } else if (me) {
-      this.map.setView([me.lat, me.lng]);
+      this.map.setCenter({ lat: me.lat, lng: me.lng });
     }
   }
 
+  /** Card in view → centre its pin and lift it above the others. */
   focus(i: number) {
+    this.placeMarkers.forEach((m, j) => {
+      if (!m) return;
+      (m.content as HTMLElement).classList.toggle("active", i === j);
+      m.zIndex = i === j ? 999 : j;
+    });
     const m = this.placeMarkers[i];
-    if (!m) return;
-    this.map.setView(m.getLatLng(), Math.max(this.map.getZoom(), 15));
-    if (this.map.getSize().y > 260) m.openPopup(); // too cramped for a popup in the half-open drawer
+    if (m?.position) this.map.panTo(m.position);
   }
 }

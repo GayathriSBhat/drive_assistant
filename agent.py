@@ -633,6 +633,28 @@ class KenDrive(Agent):
         return res
 
     @function_tool
+    async def where_am_i(self, ctx: RunContext) -> dict[str, Any]:
+        """Tell the driver where they are right now: neighbourhood, city, the nearest landmark or
+        street address, and which way they're heading. Use for "where am I?", "what area is this?"."""
+        loc = self.s.location()
+        area, nearest = await asyncio.gather(
+            self.s.maps.locality(loc),
+            self.s.maps.nearest_landmark(loc),
+        )
+        out: dict[str, Any] = {"area": area or "unknown area"}
+        if nearest:
+            out["near"] = nearest["name"]
+            out["distance_to_it"] = fmt_dist(nearest["distance_m"])
+            if nearest.get("address"):
+                out["street_address"] = nearest["address"]
+        hdg = self.s.heading()
+        if hdg is not None:
+            out["heading"] = ["north", "north-east", "east", "south-east", "south", "south-west", "west", "north-west"][
+                round(hdg / 45) % 8
+            ]
+        return out
+
+    @function_tool
     async def clear_route(self, ctx: RunContext) -> str:
         """Cancel the active route / navigation."""
         self.s.route = self.s.destination = None

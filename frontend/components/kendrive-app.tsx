@@ -1,18 +1,23 @@
 "use client";
 
 import { LiveKitRoom } from "@livekit/components-react";
-import { X } from "lucide-react";
+import { Maximize2, Minimize2, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { fmtDist, fmtDur } from "@/lib/format";
 import { MapController } from "@/lib/map-controller";
-import type { DrawerSnap, LatLng, Loc, OrbState, Place, UiEvent } from "@/lib/types";
-import MapDrawer from "./map-drawer";
+import type { LatLng, Loc, OrbState, Place, UiEvent } from "@/lib/types";
 import ResultCards from "./result-cards";
 import SessionBridge, { type SessionApi } from "./session-bridge";
-import TopBar, { type LocMode } from "./top-bar";
+import ConversationBar from "./conversation-bar";
+import Hero from "./hero";
+import LiveCaptions from "./live-captions";
+import TopBar from "./top-bar";
 import VoiceOrb from "./voice-orb";
 
 // Demo locations. Dubai has no open live-parking feed; Singapore publishes live car-park availability.
+// Live GPS by default; ?demo (Dubai) or ?demo=singapore pins a demo location.
+type LocMode = "gps" | "dubai" | "singapore";
+
 const DEMO: Record<"dubai" | "singapore", Loc & { label: string }> = {
   dubai: { lat: 25.1972, lng: 55.2744, heading: null, label: "Dubai demo" }, // Downtown Dubai (Burj Khalifa)
   singapore: { lat: 1.2847, lng: 103.8325, heading: null, label: "Singapore demo" }, // Tiong Bahru
@@ -82,15 +87,14 @@ export default function KenDriveApp() {
   const [paused, setPaused] = useState(false);
   const [micAvailable, setMicAvailable] = useState(true);
   const [locMode, setLocMode] = useState<LocMode>(initialLocMode);
-  const [trackedLoc, setTrackedLoc] = useState<Loc | null>(null); // from GPS or the drive simulator
+  const [trackedLoc, setTrackedLoc] = useState<Loc | null>(null); // from GPS
   const [results, setResults] = useState<{ title: string; category: string; places: Place[] } | null>(null);
   const [route, setRoute] = useState<RouteState | null>(null);
-  const [snap, setSnap] = useState<DrawerSnap>("hidden");
-  const [flashKey, setFlashKey] = useState(0);
+  // The map floats in as a card when there's something to show (results or a route); tap to expand it.
+  const [mapView, setMapView] = useState<"hidden" | "card" | "expanded">("hidden");
   const [toast, setToast] = useState<Toast | null>(null);
-  const [simulating, setSimulating] = useState(false);
 
-  const loc: Loc | null = locMode === "dubai" || locMode === "singapore" ? DEMO[locMode] : trackedLoc;
+  const loc: Loc | null = locMode === "gps" ? trackedLoc : DEMO[locMode];
   const locRef = useRef(loc);
   useEffect(() => {
     locRef.current = loc;
@@ -110,15 +114,25 @@ export default function KenDriveApp() {
   }, [toast]);
 
   // ---------------------------------------------------------------- map
+  // Google Maps loads asynchronously; a tapped pin scrolls its card into view.
+  const [pinFocus, setPinFocus] = useState<{ index: number; at: number } | null>(null);
+  const [mapReady, setMapReady] = useState(false); // false if Maps failed to load: cards still work without it
   useEffect(() => {
     if (!mapElRef.current) return;
-    const ctl = new MapController(mapElRef.current, [DEMO.dubai.lat, DEMO.dubai.lng], () => {
-      const overlay = cardsRef.current ?? routeCardRef.current;
-      return overlay ? overlay.offsetHeight + 8 : 0;
-    });
-    mapRef.current = ctl;
+    let cancelled = false;
+    // Google calls this when the key is rejected (e.g. Maps JavaScript API not enabled for it).
+    (window as unknown as { gm_authFailure?: () => void }).gm_authFailure = () => setMapReady(false);
+    MapController.create(mapElRef.current, [DEMO.dubai.lat, DEMO.dubai.lng], (index) => setPinFocus({ index, at: Date.now() }))
+      .then((ctl) => {
+        if (cancelled) return ctl.destroy();
+        mapRef.current = ctl;
+        setMapReady(true);
+        if (locRef.current) ctl.setMe(locRef.current, true);
+      })
+      .catch((e) => console.warn("Google Maps unavailable; showing cards without a map.", e));
     return () => {
-      ctl.destroy();
+      cancelled = true;
+      mapRef.current?.destroy();
       mapRef.current = null;
     };
   }, []);
@@ -131,23 +145,22 @@ export default function KenDriveApp() {
     async (reason: "timeout" | "error") => {
       setLocMode("dubai");
       if (!gpsSupported()) {
-        showToast("GPS needs HTTPS — using the Dubai demo location.");
+        showToast("Live location needs a secure (https) link. Showing Dubai for now.");
         return;
       }
-      const retry = { label: "Use GPS", run: () => setLocMode("gps") };
+      const retry = { label: "Use my location", run: () => setLocMode("gps") };
       if (reason === "timeout") {
-        showToast("Couldn't get a GPS fix — using the Dubai demo location.", "info", retry);
+        showToast("No GPS signal yet. Showing Dubai for now.", "info", retry);
       } else if ((await gpsPermission()) === "denied") {
-        showToast("Location is blocked — allow it for this site in your browser settings, then tap Use GPS.", "info", retry);
+        showToast("Location is off for this site. Turn it on in your browser settings, then try again.", "info", retry);
       } else {
-        showToast("No location access — using the Dubai demo location.", "info", retry);
+        showToast("KenDrive works best with your location. Showing Dubai for now.", "info", retry);
       }
     },
     [showToast],
   );
 
   useEffect(() => {
-    if (locMode === "sim") return; // the simulator drives the location
     if (locMode !== "gps") {
       mapRef.current?.setMe(DEMO[locMode], true);
       return;
@@ -178,7 +191,6 @@ export default function KenDriveApp() {
     };
   }, [locMode, gpsFallback]);
 
-  const where = `Driving tracker · ${locMode === "gps" ? "live GPS" : locMode === "sim" ? "simulated drive" : DEMO[locMode].label}`;
 
   // ---------------------------------------------------------------- session
   const startSession = useCallback(async () => {
@@ -191,12 +203,15 @@ export default function KenDriveApp() {
       setMicAvailable(true);
       setConn({ url, token });
     } catch (e) {
-      showToast(`Couldn't start voice: ${(e as Error).message}`, "danger");
+      showToast(`Couldn't connect: ${(e as Error).message}`, "danger");
       setConnecting(false);
     }
   }, [conn, connecting, showToast]);
 
-  const endSession = useCallback(() => setConn(null), []);
+  const endSession = useCallback(() => {
+    setConn(null);
+    setConnecting(false);
+  }, []);
   const onSessionReady = useCallback((api: SessionApi) => {
     apiRef.current = api;
   }, []);
@@ -206,7 +221,7 @@ export default function KenDriveApp() {
     setConnecting(false);
   }, []);
   const onDisconnected = useCallback(() => {
-    if (liveRef.current) showToast("Session ended. Tap KenDrive to start again.");
+    if (liveRef.current) showToast("Call ended. Tap the orb whenever you need me.");
     setLive(false);
     setConn(null);
     setConnecting(false);
@@ -215,7 +230,7 @@ export default function KenDriveApp() {
   }, [showToast]);
   const onMediaDeviceFailure = useCallback(() => {
     setMicAvailable(false);
-    showToast("Microphone unavailable — you can type instead.");
+    showToast("Can't reach your microphone. You can type instead.");
   }, [showToast]);
 
   // Tap the orb: start a session, then pause / resume it.
@@ -268,13 +283,20 @@ export default function KenDriveApp() {
       const ctl = mapRef.current;
       if (evt.type === "places") {
         setResults({ title: evt.title ?? CATEGORY_TITLES[evt.category] ?? CATEGORY_TITLES.other, category: evt.category, places: evt.places });
-        ctl?.showPlaces(evt.places, evt.category, locRef.current);
-        setSnap("full");
-        setFlashKey((k) => k + 1);
-        setTimeout(refreshMap, 60);
+        try {
+          ctl?.showPlaces(evt.places, evt.category, locRef.current);
+        } catch (e) {
+          console.warn("map pins", e);
+        }
+        setMapView((v) => (v === "hidden" ? "card" : v));
       } else if (evt.type === "route") {
         const c = evt.chosen;
-        const path = ctl?.showRoute(evt) ?? [];
+        let path: LatLng[] = [];
+        try {
+          path = ctl?.showRoute(evt) ?? [];
+        } catch (e) {
+          console.warn("map route", e);
+        }
         const traffic =
           c.traffic_delay_s == null ? "free-flow ETA" : c.traffic_delay_s > 60 ? `+${fmtDur(c.traffic_delay_s)} traffic` : "light traffic";
         setResults(null);
@@ -286,13 +308,11 @@ export default function KenDriveApp() {
           distance: fmtDist(c.distance_m),
           detail: `To ${evt.destination.name} · ${c.summary || "fastest route"} · ${traffic}`,
         });
-        setSnap("full");
-        setFlashKey((k) => k + 1);
-        setTimeout(refreshMap, 60);
+        setMapView((v) => (v === "hidden" ? "card" : v));
       } else if (evt.type === "clear_route") {
         ctl?.clearRoute();
         setRoute(null);
-        setSnap("hidden");
+        setMapView("hidden");
       }
     },
     [refreshMap],
@@ -300,70 +320,29 @@ export default function KenDriveApp() {
 
   const clearResults = useCallback(() => {
     setResults(null);
-    setSnap("hidden");
+    if (!route) setMapView("hidden");
     mapRef.current?.clearPlaces();
     mapRef.current?.setFit(route?.path ?? null);
-    setTimeout(refreshMap, 60);
-  }, [route, refreshMap]);
+  }, [route]);
 
   const clearRoute = useCallback(() => {
     if (live) void say("Cancel the route");
     mapRef.current?.clearRoute();
     mapRef.current?.setFit(null);
     setRoute(null);
-    setSnap("hidden");
-  }, [live, say]);
+    if (!results) setMapView("hidden");
+  }, [live, say, results]);
 
-  // Navigate buttons inside Leaflet popups.
+  // Leaflet needs a resize once the card has finished growing / shrinking.
   useEffect(() => {
-    const onClick = (e: MouseEvent) => {
-      const go = (e.target as HTMLElement).closest<HTMLElement>("button[data-go]");
-      if (!go) return;
-      mapRef.current?.map.closePopup();
-      void say(`Take me to ${go.dataset.go}`);
-    };
-    document.addEventListener("click", onClick);
-    return () => document.removeEventListener("click", onClick);
-  }, [say]);
+    if (mapView === "hidden") return;
+    const t = setTimeout(refreshMap, 380);
+    return () => clearTimeout(t);
+  }, [mapView, results, route, refreshMap]);
 
-  // ---------------------------------------------------------------- drive simulation (demo)
-  const simTimer = useRef<ReturnType<typeof setInterval>>(undefined);
-  const stopSim = useCallback(() => {
-    clearInterval(simTimer.current);
-    simTimer.current = undefined;
-    setSimulating(false);
-  }, []);
-  const startSim = useCallback(() => {
-    if (!route?.path.length) return;
-    if (simTimer.current) return stopSim();
-    setLocMode("sim");
-    setSimulating(true);
-    const path = route.path;
-    let i = 0;
-    let t = 0;
-    const STEP_M = 60; // ~60 m per tick ≈ fast-forwarded city driving
-    const dist = (a: LatLng, b: LatLng) => Math.hypot((b[0] - a[0]) * 111_320, (b[1] - a[1]) * 111_320 * Math.cos((a[0] * Math.PI) / 180));
-    simTimer.current = setInterval(() => {
-      if (i >= path.length - 1) return stopSim();
-      t += STEP_M / (dist(path[i], path[i + 1]) || 1);
-      while (t >= 1 && i < path.length - 1) {
-        t -= 1;
-        i++;
-      }
-      const a = path[i];
-      const b = path[Math.min(i + 1, path.length - 1)];
-      const lat = a[0] + (b[0] - a[0]) * t;
-      const lng = a[1] + (b[1] - a[1]) * t;
-      const heading = ((Math.atan2(b[1] - a[1], b[0] - a[0]) * 180) / Math.PI + 360) % 360;
-      const next = { lat, lng, heading };
-      setTrackedLoc(next);
-      mapRef.current?.setMe(next);
-      mapRef.current?.panTo(next);
-    }, 700);
-  }, [route, stopSim]);
-  useEffect(() => stopSim, [stopSim]);
 
-  // ---------------------------------------------------------------- drawer summary
+
+  // ---------------------------------------------------------------- map card title
   const summary = useMemo(() => {
     if (results) return { title: results.title, sub: `${results.places.length} result${results.places.length === 1 ? "" : "s"}` };
     if (route) return { title: route.title, sub: route.sub };
@@ -371,106 +350,34 @@ export default function KenDriveApp() {
   }, [results, route]);
 
   return (
-    <div className="phone" ref={phoneRef} data-drawer={snap}>
-      <TopBar
-        ref={topbarRef}
-        where={where}
-        conn={live ? "live" : connecting || conn ? "connecting" : "offline"}
-        locMode={locMode}
-        onLocMode={(m) => {
-          stopSim();
-          if (m === "gps" && !gpsSupported()) void gpsFallback("error");
-          else setLocMode(m);
-        }}
-        canSimulate={!!route}
-        simulating={simulating}
-        onSimulate={startSim}
-        onRecenter={() => loc && mapRef.current?.setMe(loc, true)}
-        canEnd={live}
-        onEnd={endSession}
-
-      />
-
-      {/* Lower layer: only the orb. It never moves or resizes; the drawer slides over it. */}
-      <main className="stage">
-        <VoiceOrb ref={orbRef} state={orbState} onTap={onOrbTap} />
-      </main>
-
-      {/* Upper layer: everything else. */}
-      <MapDrawer
-        snap={snap}
-        onSnap={setSnap}
-        onSettled={refreshMap}
-        flashKey={flashKey}
-        phoneRef={phoneRef}
-        topbarRef={topbarRef}
-        orbRef={orbRef}
-        body={
-          <>
-            <div id="map" ref={mapElRef} aria-label="Map" />
-            {snap !== "hidden" && (
-              <div className="map-overlay-header">
-                <div className="map-overlay-text">
-                  <div className="map-overlay-title">{summary.title}</div>
-                  <div className="map-overlay-sub">{summary.sub}</div>
-                </div>
-                <button
-                  className="map-overlay-close icon-btn"
-                  aria-label="Close map"
-                  onClick={results ? clearResults : clearRoute}
-                >
-                  <X size={16} />
-                </button>
-              </div>
-            )}
-            {results && (
-              <ResultCards
-                ref={cardsRef}
-                places={results.places}
-                onNavigate={(p) => void say(`Take me to ${p.name}, ${p.address ?? ""}`)}
-                onFocus={(i) => mapRef.current?.focus(i)}
-              />
-            )}
-            {route && !results && (
-              <div className="route-card" ref={routeCardRef}>
-                <div className="route-main">
-                  <div>
-                    <div className="eta">
-                      {route.eta}
-                      <small>{route.distance}</small>
-                    </div>
-                    <div className="route-sub">{route.detail}</div>
-                  </div>
-                  <button className="icon-btn small" onClick={clearRoute} aria-label="Clear route">
-                    ✕
-                  </button>
-                </div>
-              </div>
-            )}
-          </>
-        }
-        sheet={null}
-      />
-
-      {toast && (
-        <div className={`toast ${toast.kind}`} key={toast.id} role="status">
-          {toast.text}
-          {toast.action && (
-            <button
-              className="toast-action"
-              onClick={() => {
-                const { run } = toast.action!;
-                setToast(null);
-                run();
-              }}
-            >
-              {toast.action.label}
-            </button>
-          )}
+    <div className="phone" ref={phoneRef} data-map={mapView}>
+      {/* Floating map card: outside the room, which remounts its children on connect (Leaflet must keep its element). */}
+      <section
+        className="float-map"
+        data-view={mapReady ? mapView : "hidden"}
+        aria-hidden={!mapReady || mapView === "hidden"}
+        aria-label="Map"
+      >
+        <div id="map" ref={mapElRef} />
+        <div className="float-map-head">
+          <div className="float-map-text">
+            <div className="float-map-title">{summary.title}</div>
+            <div className="float-map-sub">{summary.sub}</div>
+          </div>
+          <button
+            className="icon-btn"
+            aria-label={mapView === "expanded" ? "Shrink map" : "Expand map"}
+            onClick={() => setMapView((v) => (v === "expanded" ? "card" : "expanded"))}
+          >
+            {mapView === "expanded" ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
+          </button>
+          <button className="icon-btn" aria-label="Close" onClick={results ? clearResults : clearRoute}>
+            <X size={15} />
+          </button>
         </div>
-      )}
+      </section>
 
-      {/* Voice session (no visible UI of its own). */}
+      {/* The whole UI sits in the room (display: contents) so the call controls and captions can use its hooks. */}
       <LiveKitRoom
         serverUrl={conn?.url}
         token={conn?.token}
@@ -480,8 +387,72 @@ export default function KenDriveApp() {
         onDisconnected={onDisconnected}
         onMediaDeviceFailure={onMediaDeviceFailure}
         onError={(e) => showToast(`Voice error: ${e.message}`, "danger")}
-        style={{ display: "none" }}
+        className="room"
       >
+        <TopBar ref={topbarRef} />
+
+        {/* The orb, with the intro before a call and live captions during one. It shrinks while cards float in. */}
+        <main className="stage" data-compact={mapView !== "hidden" || !!results || !!route || undefined}>
+          {orbState === "idle" && <Hero onPrompt={(t) => void say(t)} />}
+          <VoiceOrb ref={orbRef} state={orbState} onTap={onOrbTap} />
+          <LiveCaptions state={orbState} compact={mapView !== "hidden" || !!results || !!route} />
+        </main>
+
+        {/* Bottom dock: notices, results and the route float in above the call bar, then go. */}
+        <div className="dock">
+          {toast && (
+            <div className={`toast ${toast.kind}`} key={toast.id} role="status">
+              {toast.text}
+              {toast.action && (
+                <button
+                  className="toast-action"
+                  onClick={() => {
+                    const { run } = toast.action!;
+                    setToast(null);
+                    run();
+                  }}
+                >
+                  {toast.action.label}
+                </button>
+              )}
+            </div>
+          )}
+          {results && mapView !== "expanded" && (
+            <ResultCards
+              ref={cardsRef}
+              places={results.places}
+              onNavigate={(p) => void say(`Take me to ${p.name}, ${p.address ?? ""}`)}
+              onFocus={(i) => mapRef.current?.focus(i)}
+              scrollTo={pinFocus}
+            />
+          )}
+          {route && !results && (
+            <div className="route-card" ref={routeCardRef}>
+              <div className="route-main">
+                <div>
+                  <div className="eta">
+                    {route.eta}
+                    <small>{route.distance}</small>
+                  </div>
+                  <div className="route-sub">{route.detail}</div>
+                </div>
+                <button className="icon-btn small" onClick={clearRoute} aria-label="Clear route">
+                  <X size={14} />
+                </button>
+              </div>
+            </div>
+          )}
+          <ConversationBar
+            live={live}
+            connecting={connecting || (!!conn && !live)}
+            muted={paused}
+            onToggleMute={() => setPaused((p) => !p)}
+            onCall={() => void startSession()}
+            onEnd={endSession}
+            onSend={(t) => void say(t)}
+          />
+        </div>
+
         <SessionBridge
           loc={loc}
           paused={paused}

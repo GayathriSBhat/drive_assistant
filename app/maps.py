@@ -295,6 +295,34 @@ class Maps:
         city = parts.get("locality") or parts.get("administrative_area_level_2") or ""
         return ", ".join(x for x in (area, city) if x)
 
+    async def nearest_landmark(self, origin: LatLng) -> dict[str, Any] | None:
+        """The closest named place (shop, building, landmark) within 300 m, for "where am I?"."""
+        try:
+            places = await self._places_post(
+                "searchNearby",
+                {
+                    "maxResultCount": 1,
+                    "rankPreference": "DISTANCE",
+                    "locationRestriction": {
+                        "circle": {"center": {"latitude": origin[0], "longitude": origin[1]}, "radius": 300.0}
+                    },
+                    "languageCode": "en",
+                },
+                ["displayName", "shortFormattedAddress", "location"],
+            )
+        except MapsError as e:
+            log.warning("nearest landmark lookup failed: %s", e)
+            return None
+        if not places:
+            return None
+        p = places[0]
+        at = p.get("location") or {}
+        return {
+            "name": (p.get("displayName") or {}).get("text", ""),
+            "address": p.get("shortFormattedAddress"),
+            "distance_m": haversine(origin, (at.get("latitude", origin[0]), at.get("longitude", origin[1]))),
+        }
+
     # ---------- Routing ----------
 
     async def routes(self, origin: LatLng, dest: LatLng, via: LatLng | None = None) -> list[Route]:

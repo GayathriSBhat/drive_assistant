@@ -1,6 +1,6 @@
 "use client";
 
-// AI Elements <Persona /> (Rive), as used in apurva-livekit's agent view — tinted KenDrive blue.
+// AI Elements <Persona /> (Rive), as used in apurva-livekit's agent view — tinted Kenpath marigold.
 import type { RiveParameters } from "@rive-app/react-webgl2";
 import {
   useRive,
@@ -24,8 +24,8 @@ const sources = {
   obsidian: { dynamicColor: true, hasModel: true, source: "https://ejiidnob33g9ap1r.public.blob.vercel-storage.com/obsidian-2.0.riv" },
 };
 
-/** KenDrive blue (Tailwind blue-400 — the brighter tint reads better on the dark UI). */
-export const KENDRIVE_BLUE: [number, number, number] = [96, 165, 250];
+/** Kenpath marigold, the brand's single accent. */
+export const KENPATH_MARIGOLD: [number, number, number] = [237, 170, 87];
 
 // Delays Rive initialisation by one frame so React Strict Mode's immediate unmount never
 // creates a WebGL2 context; only the real mount initialises (avoids context exhaustion).
@@ -70,7 +70,7 @@ interface PersonaProps {
   onLoadError?: RiveParameters["onLoadError"];
 }
 
-export const Persona: FC<PersonaProps> = memo(({ state, variant = "obsidian", color = KENDRIVE_BLUE, className, onLoadError }) => {
+export const Persona: FC<PersonaProps> = memo(({ state, variant = "obsidian", color = KENPATH_MARIGOLD, className, onLoadError }) => {
   const source = sources[variant];
   const ready = useStrictModeSafeInit();
   const { rive, RiveComponent } = useRive(

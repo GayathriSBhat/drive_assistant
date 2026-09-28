@@ -56,7 +56,7 @@ export default function SessionBridge({ loc, paused, micAvailable, onAgentState,
     }
   }, [state]);
 
-  // Agent → UI events (cards, routes). Transcripts are not displayed, but the streams are drained.
+  // Agent → UI events (cards, routes). Transcripts are read by <LiveCaptions> (useTranscriptions).
   const onUiEventRef = useRef(onUiEvent);
   useEffect(() => {
     onUiEventRef.current = onUiEvent;
@@ -69,14 +69,9 @@ export default function SessionBridge({ loc, paused, micAvailable, onAgentState,
         console.error("ui.event", e);
       }
     };
-    const drain = async (reader: TextStreamReader) => {
-      for await (const chunk of reader) void chunk;
-    };
     room.registerTextStreamHandler("ui.event", ui);
-    room.registerTextStreamHandler("lk.transcription", drain);
     return () => {
       room.unregisterTextStreamHandler("ui.event");
-      room.unregisterTextStreamHandler("lk.transcription");
     };
   }, [room]);
 

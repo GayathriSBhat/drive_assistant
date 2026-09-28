@@ -72,4 +72,3 @@ export type UiEvent =
 /** What the orb shows. */
 export type OrbState = "idle" | "connecting" | "listening" | "thinking" | "speaking" | "muted" | "paused";
 
-export type DrawerSnap = "hidden" | "peek" | "half" | "full";

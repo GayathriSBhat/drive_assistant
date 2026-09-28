@@ -17,13 +17,13 @@ const PERSONA_STATE: Record<OrbState, PersonaState> = {
 
 // No text is drawn around the orb; its state lives in the accessible label / hover title.
 const LABELS: Record<OrbState, string> = {
-  idle: "Tap to start",
+  idle: "Tap to talk",
   connecting: "Connecting...",
   listening: "Listening...",
   thinking: "Thinking...",
   speaking: "Speaking...",
   muted: "Mic unavailable — type below",
-  paused: "Paused · tap to resume",
+  paused: "Muted · tap to unmute",
 };
 
 interface Props {
