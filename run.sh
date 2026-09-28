@@ -9,7 +9,7 @@ if ! grep -qE '^(GOOGLE_API_KEY|GEMINI_API_KEY)=.+' .env; then
 fi
 
 # Free the ports in case a previous run is still alive.
-for port in 7880 8000; do
+for port in 7880 8000 3000; do
   lsof -ti "tcp:$port" -sTCP:LISTEN | xargs kill 2>/dev/null || true
 done
 pkill -f "agent.py dev" 2>/dev/null || true
@@ -22,6 +22,7 @@ livekit-server --dev --bind 0.0.0.0 > data/livekit.log 2>&1 &
 uv run uvicorn server:app --host 0.0.0.0 --port 8000 --log-level warning &
 sleep 2
 uv run agent.py dev --log-level info &
-echo; echo "  KenDrive → http://localhost:8000  (add ?demo to force the Dubai demo location)"
+(cd frontend && npm run dev -- --port 3000) &
+echo; echo "  KenDrive → http://localhost:3000  (?demo = Dubai, ?demo=singapore = Singapore with live parking)"
 echo "  LiveKit server logs → data/livekit.log"; echo
 wait

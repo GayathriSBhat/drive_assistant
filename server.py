@@ -1,4 +1,4 @@
-"""Web backend: LiveKit tokens, crowd-sourced road reports (+ live SSE feed), static frontend.
+"""API backend for the Next.js app in ./frontend: LiveKit tokens, place photos, road reports (+ SSE).
 
 Run:  uv run uvicorn server:app --host 0.0.0.0 --port 8000 --reload
 """
@@ -18,7 +18,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from livekit import api
 from pydantic import BaseModel
@@ -282,9 +282,9 @@ async def events(request: Request) -> StreamingResponse:
 
 
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
-app.mount("/static", StaticFiles(directory=ROOT / "web"), name="static")
 
 
 @app.get("/")
-async def index() -> FileResponse:
-    return FileResponse(ROOT / "web" / "index.html")
+async def index() -> RedirectResponse:
+    """The UI is the Next.js app in ./frontend (it proxies /api/* back here)."""
+    return RedirectResponse(os.getenv("FRONTEND_URL", "http://localhost:3000"))

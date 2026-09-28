@@ -1,0 +1,10 @@
+.git
+.venv
+.env
+.env.*
+!.env.example
+data
+frontend
+web
+**/__pycache__
+*.log

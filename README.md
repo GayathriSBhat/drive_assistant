@@ -28,42 +28,52 @@ that appear live for every user.
 > button and report pins, drops `report_blockage`, and turns off rerouting around reports and spoken alerts.
 > "Congestion ahead?" then uses route traffic delay and news only. Set it to `true` and restart to bring it all back.
 
-## Screen
-- **Orb** (centre): the AI Elements **Persona** (Rive "obsidian"), tinted KenDrive blue (`web/persona.js`). Nothing but the orb is shown in the centre: no name, status, caption or transcript. Its state is in its hover title and accessible label. **Tap the orb** to start a session, then tap again to **pause or resume** (the orb dims while paused). "End voice session" in the ⋯ menu ends the session. Short notices appear as a toast at the top.
-- **Cards** (AppSheet-style "Large" card view): photo, badges, title, subtitle, tags, a review or menu quote, and Navigate / Maps / Call actions.
-- **Map drawer**: a bottom sheet above the quick actions. Drag the grip between **peek** (a one-line summary such as "3 min to Dubai Mall"), **half** and **full**; tap it to toggle, or use arrow keys. A new route opens it to half automatically. When full, its header shows a mini orb and pause button.
+## Screen (Next.js app in `frontend/`)
+- **Orb**: the AI Elements **Persona** (Rive "obsidian"), tinted KenDrive blue (`frontend/components/persona.tsx`). It sits alone in the lower layer and never moves or resizes. **Tap** it to start a session, then tap again to **pause/resume**; "End voice session" is in the ⋯ menu.
+- **Drawer** (upper layer): map, results (AppSheet-style cards) and route. It slides over the orb.
+- **Location**: ⋯ menu → Live GPS, Demo · Dubai, or Demo · Singapore (live parking data). Or use the `?demo` / `?demo=singapore` URL parameters.
 
 ## Architecture
 
 ```
-Browser (web/)  ──WebRTC audio + text──►  LiveKit server  ◄──►  agent.py (LiveKit Agents + Gemini Live)
-   │  participant attributes: lat/lng/heading                     │  tools: Places / Routes / Grounding Lite / ddgs
-   │  ◄── "ui.event" text stream: pins, routes ───────────────────┘
-   └──HTTP/SSE──► server.py (FastAPI): /api/token, /api/reports (+photo), /api/events (live feed)
+Next.js (frontend/)  ──WebRTC audio + text──►  LiveKit server  ◄──►  agent.py (LiveKit Agents + Gemini Live)
+   │  participant attributes: lat/lng/heading                          │  tools: Places / Routes / Grounding Lite /
+   │  ◄── "ui.event" text stream: cards, routes ───────────────────────┘  ddgs / live parking APIs
+   └── /api/* (Next.js rewrite) ──► server.py (FastAPI): /api/token, /api/place-photo, /api/reports, /api/events
 ```
 
 ## Run
 
-Needs `uv`, and `livekit-server` (`brew install livekit`).
+First fill in `.env` (copy `.env.example`):
+- `GEMINI_API_KEY` (or `GOOGLE_API_KEY`): **Gemini API key** from https://aistudio.google.com/apikey (required for voice).
+- `GOOGLE_PLACES_API_KEY`: Maps key with **Places API (New)**. Optionally also enable **Routes API**
+  (traffic-aware ETAs) and **Maps Grounding Lite API** on the key.
+- Optional: `LTA_ACCOUNT_KEY` (Singapore LTA DataMall) adds live counts for malls and attractions in Singapore.
 
-1. Fill in `.env` (see `.env.example`):
-   - `GOOGLE_API_KEY`: **Gemini API key** from https://aistudio.google.com/apikey (required for voice).
-   - `GOOGLE_PLACES_API_KEY`: Maps key with **Places API (New)**. Optionally also enable
-     **Routes API** (traffic-aware ETAs and delays) and **Maps Grounding Lite API** on the key.
-2. `./run.sh` starts `livekit-server --dev`, the web server (:8000) and the agent.
-3. Open http://localhost:8000 (add `?demo` to use a fixed Downtown Dubai location), tap the orb and talk,
-   or tap a chip or type.
-
-Demo tips: the **⋯** menu can switch to the demo location and **simulate driving** along the
-active route. To show "other users", post a report from a second browser tab or with curl:
+### With Docker
 
 ```bash
-curl -X POST localhost:8000/api/reports -F lat=12.9661 -F lng=77.6085 -F "note=Ganesha procession blocking Richmond Road"
+docker compose up --build
 ```
 
+Then open http://localhost:3000. The stack is `livekit` (dev mode), `api` (FastAPI :8000), `agent` (voice agent) and
+`web` (Next.js :3000). Road-report data is kept in `./data`. The agent shares LiveKit's network namespace so the
+media address LiveKit advertises (`127.0.0.1`) works for both the browser and the agent. For a server deployment,
+set `--node-ip` to the server's public IP, open ports 7880–7882, and use `LIVEKIT_PUBLIC_URL=wss://…`.
+
+### Without Docker
+
+Needs `uv`, Node 20+, and `livekit-server` (`brew install livekit`). Run `(cd frontend && npm install)` once, then:
+
+```bash
+./run.sh
+```
+
+It starts LiveKit, the API (:8000), the agent and the Next.js dev server (:3000). Open http://localhost:3000.
+
 ### On a real phone
-Mic and GPS need HTTPS. Expose port 8000 and port 7880 through a tunnel (e.g. `cloudflared`/`ngrok`),
-set `LIVEKIT_PUBLIC_URL=wss://<tunnel-for-7880>`, and open the 8000 tunnel URL. Or use LiveKit Cloud:
+Mic and GPS need HTTPS. Expose ports 3000 and 7880 through a tunnel (e.g. `cloudflared`/`ngrok`),
+set `LIVEKIT_PUBLIC_URL=wss://<tunnel-for-7880>`, and open the 3000 tunnel URL. Or use LiveKit Cloud:
 set `LIVEKIT_URL/API_KEY/API_SECRET` to your project and skip the local server.
 
 ## Notes / limits
