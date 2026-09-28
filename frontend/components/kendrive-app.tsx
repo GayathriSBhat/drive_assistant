@@ -5,6 +5,7 @@ import { Maximize2, Minimize2, X } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { fmtDist, fmtDur } from "@/lib/format";
 import { MapController } from "@/lib/map-controller";
+import { useThinkingSound } from "@/lib/use-thinking-sound";
 import type { LatLng, Loc, OrbState, Place, UiEvent } from "@/lib/types";
 import ResultCards from "./result-cards";
 import SessionBridge, { type SessionApi } from "./session-bridge";
@@ -279,6 +280,8 @@ export default function KenDriveApp() {
           : agentState === "speaking"
             ? "speaking"
             : "connecting";
+
+  useThinkingSound(orbState === "thinking");
 
   // ---------------------------------------------------------------- agent → UI
   const onUiEvent = useCallback(

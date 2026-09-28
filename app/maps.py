@@ -421,6 +421,7 @@ class Maps:
             "travelMode": "DRIVE",
             "routingPreference": "TRAFFIC_AWARE",
             "polylineQuality": "OVERVIEW",
+            "languageCode": "en",  # road names / turn text in English (else local script, e.g. Arabic in Dubai)
             "extraComputations": ["TOLLS"],
             "routeModifiers": {
                 "avoidTolls": "tolls" in avoid,

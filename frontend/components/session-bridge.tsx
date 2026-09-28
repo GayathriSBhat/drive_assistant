@@ -96,7 +96,7 @@ export default function SessionBridge({ loc, paused, micAvailable, onAgentState,
     else trailing.current = setTimeout(send, wait);
   }, [loc, connection, room]);
 
-  // Pause: mic off (KenDrive's audio is muted by <RoomAudioRenderer muted>).
+  // Mute = the driver's mic only. KenDrive keeps talking (a muted mic shouldn't silence the answer).
   useEffect(() => {
     if (connection !== ConnectionState.Connected || !micAvailable) return;
     room.localParticipant.setMicrophoneEnabled(!paused).catch((e) => console.warn("mic", e));
@@ -113,5 +113,5 @@ export default function SessionBridge({ loc, paused, micAvailable, onAgentState,
     });
   }, [room, onReady]);
 
-  return <RoomAudioRenderer muted={paused} />;
+  return <RoomAudioRenderer />;
 }
