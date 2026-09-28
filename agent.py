@@ -34,7 +34,7 @@ from app.ev_parking import (
 )
 from app.parking_live import coverage, live_lots_near
 from app.parking_web import check_parking_online
-from app.maps import Maps, MapsError, Route
+from app.maps import PLACE_FIELDS, Maps, MapsError, Route
 from app.search import web_search as ddgs_search
 
 load_dotenv()
@@ -53,6 +53,25 @@ NEARBY_ALERT_M = 5000
 TRAFFIC_WORDS = {"traffic", "jam", "diversion", "diversions", "diverted", "procession", "congestion", "closed",
                  "closure", "accident", "waterlogging", "waterlogged", "rally", "protest", "bandh", "blocked",
                  "advisory", "immersion", "flyover", "road", "roads"}
+# find_stop_on_route: kind → (text query, Places type)
+STOP_KINDS: dict[str, tuple[str, str]] = {
+    "fuel": ("petrol station", "gas_station"),
+    "coffee": ("coffee", "cafe"),
+    "food": ("restaurant", "restaurant"),
+    "restroom": ("public restroom", "public_bathroom"),
+    "ev_charging": ("EV charging station", "electric_vehicle_charging_station"),
+    "atm": ("ATM", "atm"),
+    "pharmacy": ("pharmacy", "pharmacy"),
+    "other": ("", ""),
+}
+# fuel_prices: spoken fuel → Google fuelOptions types, preferred first
+FUEL_TYPES: dict[str, list[str]] = {
+    "petrol": ["REGULAR_UNLEADED", "SP91", "SP92", "SP95", "SP91_E10", "SP95_E10", "MIDGRADE"],
+    "diesel": ["DIESEL", "DIESEL_PLUS", "TRUCK_DIESEL", "BIO_DIESEL"],
+    "premium": ["PREMIUM", "SP98", "SP99", "SP100"],
+    "cng": ["METHANE"],
+    "lpg": ["LPG"],
+}
 CITY_ALIASES = {"bengaluru": ("bangalore",), "mumbai": ("bombay",), "chennai": ("madras",), "kolkata": ("calcutta",),
                 "gurugram": ("gurgaon",)}
 
@@ -113,6 +132,9 @@ class DriveState:
     http: httpx.AsyncClient
     route: Route | None = None
     destination: dict[str, Any] | None = None
+    stops: list[dict[str, Any]] = field(default_factory=list)  # waypoints added on the way, in order
+    avoid: set[str] = field(default_factory=set)  # route preferences: tolls / highways / ferries
+    stop_candidates: list[dict[str, Any]] = field(default_factory=list)  # last find_stop_on_route results
     announced: set[str] = field(default_factory=set)
 
     # ----- driver location comes from the web app via participant attributes
@@ -481,7 +503,17 @@ class KenDrive(Agent):
         origin = self.s.location()
         try:
             dest = await self.s.maps.geocode(destination, near=origin)
-            routes = await self.s.maps.routes(origin, (dest["lat"], dest["lng"]))
+        except MapsError as e:
+            raise ToolError(str(e)) from e
+        self.s.stops = []
+        return await self._route_to(dest)
+
+    async def _route_to(self, dest: dict[str, Any]) -> dict[str, Any]:
+        """(Re)plan to `dest` via the current stops and route preferences; show it and make it active."""
+        origin = self.s.location()
+        stop_pts = [(st["lat"], st["lng"]) for st in self.s.stops]
+        try:
+            routes = await self.s.maps.routes(origin, (dest["lat"], dest["lng"]), stops=stop_pts, avoid=frozenset(self.s.avoid))
         except MapsError as e:
             raise ToolError(str(e)) from e
         if not routes:
@@ -518,6 +550,14 @@ class KenDrive(Agent):
             "route": chosen.summary,
             "first_turns": chosen.steps[:3],
         }
+        if self.s.stops:
+            result["stops"] = [st["name"] for st in self.s.stops]
+        if chosen.tolls:
+            result["tolls"] = chosen.tolls
+        if self.s.avoid:
+            result["avoiding"] = sorted(self.s.avoid)
+            if chosen.provider != "google":
+                result["note_prefs"] = "Live routing is unavailable right now, so avoid-preferences couldn't be applied."
         if chosen.traffic_delay_s is not None:
             result["traffic_delay"] = fmt_dur(chosen.traffic_delay_s)
         else:
@@ -631,6 +671,163 @@ class KenDrive(Agent):
             res["places"] = [{"name": p["name"], "distance": fmt_dist(p["distance_m"]), "rating": p["rating"]}
                              for p in res["places"][:3]]
         return res
+
+    # ----- stops, route preferences, fuel prices, weather
+
+    @function_tool
+    async def find_stop_on_route(
+        self,
+        ctx: RunContext,
+        kind: Literal["fuel", "coffee", "food", "restroom", "ev_charging", "atm", "pharmacy", "other"],
+        keyword: str | None = None,
+    ) -> dict[str, Any]:
+        """Find places to stop ALONG the active route ("coffee on the way", "petrol before the highway"),
+        ranked by how much time the detour adds. Shows them as cards. Then offer to add the best one
+        with add_stop.
+
+        Args:
+            kind: What to stop for. Use "other" with a keyword for anything else.
+            keyword: Optional extra filter or brand, e.g. "Starbucks", "Shell", "biryani".
+        """
+        route = self.s.route
+        if not route:
+            raise ToolError("There's no active route. Plan a route first, or use find_nearby.")
+        query, ptype = STOP_KINDS[kind]
+        if not (keyword or query):
+            raise ToolError("Say what kind of stop, e.g. a keyword like 'car wash'.")
+        loc = self.s.location()
+        try:
+            found = await self.s.maps.search_along_route(
+                keyword or query, ptype, route.path, loc, PLACE_FIELDS, limit=12
+            )
+        except MapsError as e:
+            raise ToolError(str(e)) from e
+        cards = []
+        for raw, summary in found:
+            card = self.s.maps.place(raw, loc)
+            legs = summary.get("legs", [])
+            if len(legs) >= 2:
+                via_s = sum(float(leg.get("duration", "0s").rstrip("s")) for leg in legs)
+                card["drive_min"] = round(float(legs[0].get("duration", "0s").rstrip("s")) / 60)
+                card["detour_min"] = max(0, round((via_s - route.duration_s) / 60))
+            cards.append(card)
+        cards.sort(key=lambda c: (c.get("detour_min") if c.get("detour_min") is not None else 99, c["distance_m"] or 1e9))
+        cards = cards[:5]
+        if not cards:
+            return {"result": f"Nothing for {keyword or kind} along this route."}
+        self.s.stop_candidates = cards
+        await self.s.push_ui({"type": "places", "category": "other", "title": f"{(keyword or kind).capitalize()} on the way", "places": cards})
+        return {
+            "options": [
+                {"name": c["name"], "adds": f"{c['detour_min']} min" if c.get("detour_min") is not None else "unknown",
+                 "in": f"{c['drive_min']} min" if c.get("drive_min") is not None else fmt_dist(c["distance_m"]),
+                 "open_now": c["open_now"]}
+                for c in cards[:3]
+            ]
+        }
+
+    @function_tool
+    async def add_stop(self, ctx: RunContext, place_name: str) -> dict[str, Any]:
+        """Add a stop to the active route (usually one returned by find_stop_on_route) and re-plan.
+
+        Args:
+            place_name: The stop's name, as returned by find_stop_on_route, or any place/address.
+        """
+        if not self.s.route or not self.s.destination:
+            raise ToolError("There's no active route to add a stop to.")
+        name = place_name.lower()
+        stop = next((c for c in self.s.stop_candidates if name in c["name"].lower() or c["name"].lower() in name), None)
+        if stop is None:
+            try:
+                stop = await self.s.maps.geocode(place_name, near=self.s.location())
+            except MapsError as e:
+                raise ToolError(str(e)) from e
+        self.s.stops.append({"name": stop["name"], "lat": stop["lat"], "lng": stop["lng"]})
+        result = await self._route_to(self.s.destination)
+        result["added_stop"] = stop["name"]
+        return result
+
+    @function_tool
+    async def set_route_preferences(
+        self,
+        ctx: RunContext,
+        avoid_tolls: bool | None = None,
+        avoid_highways: bool | None = None,
+        avoid_ferries: bool | None = None,
+    ) -> dict[str, Any]:
+        """Change route preferences ("avoid tolls", "no highways", "tolls are fine") and re-plan the active
+        route with them. They stay on for later routes too. Leave a field empty to keep it as is.
+        """
+        for key, value in (("tolls", avoid_tolls), ("highways", avoid_highways), ("ferries", avoid_ferries)):
+            if value is True:
+                self.s.avoid.add(key)
+            elif value is False:
+                self.s.avoid.discard(key)
+        if self.s.route and self.s.destination:
+            return await self._route_to(self.s.destination)
+        return {"avoiding": sorted(self.s.avoid) or "nothing", "note": "Will apply to the next route."}
+
+    @function_tool
+    async def fuel_prices(
+        self, ctx: RunContext, fuel: Literal["petrol", "diesel", "premium", "cng", "lpg"] = "petrol"
+    ) -> dict[str, Any]:
+        """Compare fuel prices at nearby petrol stations (Google's price data; not available in every
+        country). Shows stations as cards, cheapest first when prices are known.
+
+        Args:
+            fuel: The fuel the driver needs.
+        """
+        loc = self.s.location()
+        try:
+            stations = await self.s.maps.fuel_stations(loc)
+        except MapsError as e:
+            raise ToolError(str(e)) from e
+        if not stations:
+            return {"result": "No petrol stations within 6 km."}
+        wanted = FUEL_TYPES[fuel]
+        priced = []
+        for st in stations:
+            price = next((st["fuel_prices"][t] for t in wanted if t in st["fuel_prices"]), None)
+            if price:
+                st["badge"] = {"text": f"{price['currency']} {price['amount']:.2f}", "tone": "good"}
+                priced.append((price["amount"], st))
+        if not priced:
+            await self.s.push_ui({"type": "places", "category": "fuel", "places": stations[:5]})
+            return {
+                "prices": "Google has no fuel prices for stations in this area, so I can only show the nearest ones.",
+                "nearest": [{"name": st["name"], "distance": fmt_dist(st["distance_m"])} for st in stations[:3]],
+            }
+        priced.sort(key=lambda x: (x[0], x[1]["distance_m"] or 1e9))
+        cards = [st for _, st in priced[:5]]
+        await self.s.push_ui({"type": "places", "category": "fuel", "title": f"Cheapest {fuel} nearby", "places": cards})
+        return {
+            "cheapest": [
+                {"name": st["name"], "price": st["badge"]["text"], "distance": fmt_dist(st["distance_m"])} for st in cards[:3]
+            ]
+        }
+
+    @function_tool
+    async def weather(self, ctx: RunContext, where: Literal["here", "destination"] = "here") -> dict[str, Any]:
+        """Weather for driving: now where the driver is, or at the destination around arrival time
+        ("will it rain when I get there?").
+
+        Args:
+            where: "here" for current conditions, "destination" for the forecast at the active route's
+                destination at the ETA.
+        """
+        try:
+            if where == "destination":
+                if not self.s.route or not self.s.destination:
+                    raise ToolError("There's no active route, so I don't know the destination.")
+                d = self.s.destination
+                eta_h = self.s.route.duration_s / 3600
+                out = await self.s.maps.weather_at((d["lat"], d["lng"]), eta_h)
+                out["place"] = d["name"]
+                out["arriving_in"] = fmt_dur(self.s.route.duration_s)
+                return out
+            return await self.s.maps.weather_now(self.s.location())
+        except MapsError as e:
+            raise ToolError(str(e)) from e
 
     @function_tool
     async def where_am_i(self, ctx: RunContext) -> dict[str, Any]:

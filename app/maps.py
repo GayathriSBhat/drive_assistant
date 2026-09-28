@@ -20,6 +20,7 @@ PLACES_URL = "https://places.googleapis.com/v1/places"
 ROUTES_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
 GROUNDING_LITE_URL = "https://mapstools.googleapis.com/mcp"
 OSRM_URL = "https://router.project-osrm.org/route/v1/driving"
+WEATHER_URL = "https://weather.googleapis.com/v1"
 
 CATEGORY_TYPES: dict[str, list[str]] = {
     "fuel": ["gas_station"],
@@ -63,6 +64,7 @@ class Route:
     summary: str = ""
     steps: list[str] = field(default_factory=list)
     static_duration_s: float | None = None  # duration without traffic (Routes API only)
+    tolls: str | None = None  # Routes API only: "AED 8", "tolls (price unknown)", "no tolls"; None = unknown
 
     @property
     def traffic_delay_s(self) -> float | None:
@@ -78,6 +80,7 @@ class Route:
             "summary": self.summary,
             "polyline": encode_polyline(self.path),
             "traffic_delay_s": None if self.traffic_delay_s is None else round(self.traffic_delay_s),
+            "tolls": self.tolls,
         }
 
 
@@ -186,7 +189,7 @@ class Maps:
             f"{PLACES_URL}:searchText",
             json={
                 "textQuery": query,
-                "includedType": included_type,
+                **({"includedType": included_type} if included_type else {}),
                 "pageSize": limit,
                 "searchAlongRouteParameters": {"polyline": {"encodedPolyline": encode_polyline(path)}},
                 "routingParameters": {"origin": {"latitude": origin[0], "longitude": origin[1]}},
@@ -323,21 +326,92 @@ class Maps:
             "distance_m": haversine(origin, (at.get("latitude", origin[0]), at.get("longitude", origin[1]))),
         }
 
+    # ---------- Weather API ----------
+
+    async def _weather(self, path: str, at: LatLng, **params: Any) -> dict[str, Any]:
+        r = await self.http.get(
+            f"{WEATHER_URL}/{path}",
+            params={"location.latitude": at[0], "location.longitude": at[1], **params},
+            headers={"X-Goog-Api-Key": self.api_key},
+        )
+        if r.status_code == 403:
+            raise MapsError("Weather isn't available: the Weather API isn't enabled for this Google key.")
+        if r.status_code != 200:
+            raise MapsError(f"Weather lookup failed: {r.status_code} {r.text[:200]}")
+        return r.json()
+
+    async def weather_now(self, at: LatLng) -> dict[str, Any]:
+        d = await self._weather("currentConditions:lookup", at)
+        return _weather_brief(d)
+
+    async def weather_at(self, at: LatLng, in_hours: float) -> dict[str, Any]:
+        """Hourly forecast for the hour `in_hours` from now (e.g. at the driver's ETA)."""
+        hours = max(1, min(240, int(in_hours) + 1))
+        d = await self._weather("forecast/hours:lookup", at, hours=hours)
+        slots = d.get("forecastHours", [])
+        if not slots:
+            raise MapsError("No forecast available for that place.")
+        return _weather_brief(slots[min(int(in_hours), len(slots) - 1)])
+
+    # ---------- Fuel prices (Places fuelOptions) ----------
+
+    async def fuel_stations(self, origin: LatLng, radius_m: int = 6000, limit: int = 12) -> list[dict[str, Any]]:
+        """Nearby petrol stations with Google's fuel prices where it has them (coverage varies by country)."""
+        raw = await self._places_post(
+            "searchNearby",
+            {
+                "includedPrimaryTypes": ["gas_station"],
+                "maxResultCount": 20,
+                "rankPreference": "DISTANCE",
+                "locationRestriction": {
+                    "circle": {"center": {"latitude": origin[0], "longitude": origin[1]}, "radius": float(radius_m)}
+                },
+            },
+            [*PLACE_FIELDS, "fuelOptions"],
+        )
+        out = []
+        for p in raw[:limit]:
+            place = self._place(p, origin)
+            place["fuel_prices"] = {
+                fp["type"]: {
+                    "amount": int(fp["price"].get("units", 0)) + fp["price"].get("nanos", 0) / 1e9,
+                    "currency": fp["price"].get("currencyCode", ""),
+                    "updated": fp.get("updateTime"),
+                }
+                for fp in (p.get("fuelOptions") or {}).get("fuelPrices", [])
+                if fp.get("price")
+            }
+            out.append(place)
+        return out
+
     # ---------- Routing ----------
 
-    async def routes(self, origin: LatLng, dest: LatLng, via: LatLng | None = None) -> list[Route]:
+    async def routes(
+        self,
+        origin: LatLng,
+        dest: LatLng,
+        via: LatLng | None = None,
+        *,
+        stops: list[LatLng] | None = None,
+        avoid: frozenset[str] = frozenset(),
+    ) -> list[Route]:
+        """Driving routes. `stops` are real stops (waypoints) in order; `via` is a pass-through point used to
+        force detours. `avoid` ⊆ {"tolls", "highways", "ferries"} (Routes API only; OSRM ignores it)."""
+        stops = stops or []
         if self.routes_api_enabled:
             try:
-                return await self._google_routes(origin, dest, via)
+                return await self._google_routes(origin, dest, via, stops, avoid)
             except MapsError as e:
                 if "PERMISSION_DENIED" in str(e) or "403" in str(e):
                     log.warning("Routes API not enabled for this key; using OSRM fallback (no live traffic)")
                     self.routes_api_enabled = False
                 else:
                     log.warning("Routes API error, falling back to OSRM: %s", e)
-        return await self._osrm_routes(origin, dest, via)
+        return await self._osrm_routes(origin, dest, via, stops)
 
-    async def _google_routes(self, origin: LatLng, dest: LatLng, via: LatLng | None) -> list[Route]:
+    async def _google_routes(
+        self, origin: LatLng, dest: LatLng, via: LatLng | None, stops: list[LatLng], avoid: frozenset[str]
+    ) -> list[Route]:
         def wp(p: LatLng) -> dict[str, Any]:
             return {"location": {"latLng": {"latitude": p[0], "longitude": p[1]}}}
 
@@ -347,9 +421,16 @@ class Maps:
             "travelMode": "DRIVE",
             "routingPreference": "TRAFFIC_AWARE",
             "polylineQuality": "OVERVIEW",
+            "extraComputations": ["TOLLS"],
+            "routeModifiers": {
+                "avoidTolls": "tolls" in avoid,
+                "avoidHighways": "highways" in avoid,
+                "avoidFerries": "ferries" in avoid,
+            },
         }
-        if via:
-            body["intermediates"] = [{**wp(via), "via": True}]
+        intermediates = [wp(s) for s in stops] + ([{**wp(via), "via": True}] if via else [])
+        if intermediates:
+            body["intermediates"] = intermediates
         else:
             body["computeAlternativeRoutes"] = True
         r = await self.http.post(
@@ -359,7 +440,8 @@ class Maps:
                 "X-Goog-Api-Key": self.api_key,
                 "X-Goog-FieldMask": "routes.duration,routes.staticDuration,routes.distanceMeters,"
                 "routes.polyline.encodedPolyline,routes.description,"
-                "routes.legs.steps.navigationInstruction,routes.legs.steps.distanceMeters",
+                "routes.legs.steps.navigationInstruction,routes.legs.steps.distanceMeters,"
+                "routes.travelAdvisory.tollInfo",
             },
         )
         if r.status_code != 200:
@@ -381,17 +463,18 @@ class Maps:
                     path=decode_polyline(rt["polyline"]["encodedPolyline"]),
                     summary=rt.get("description", ""),
                     steps=steps,
+                    tolls=_toll_text(rt.get("travelAdvisory", {})),
                 )
             )
         return out
 
-    async def _osrm_routes(self, origin: LatLng, dest: LatLng, via: LatLng | None) -> list[Route]:
-        pts = [origin, *([via] if via else []), dest]
+    async def _osrm_routes(self, origin: LatLng, dest: LatLng, via: LatLng | None, stops: list[LatLng]) -> list[Route]:
+        pts = [origin, *stops, *([via] if via else []), dest]
         coords = ";".join(f"{p[1]:.6f},{p[0]:.6f}" for p in pts)
         r = await self.http.get(
             f"{OSRM_URL}/{coords}",
             params={
-                "alternatives": "false" if via else "3",
+                "alternatives": "false" if via or stops else "3",
                 "overview": "full",
                 "steps": "true",
                 "geometries": "polyline",
@@ -463,3 +546,34 @@ class Maps:
                     log.warning("Grounding Lite error: %s", e)
         places = await self.nearby(near or (0, 0), "text", query=question, radius_m=10000)
         return {"source": "places_text_search", "places": places}
+
+
+def _toll_text(advisory: dict[str, Any]) -> str:
+    """Routes API tollInfo → short spoken text. Absent tollInfo means the route has no tolls."""
+    if "tollInfo" not in advisory:
+        return "no tolls"
+    prices = advisory["tollInfo"].get("estimatedPrice") or []
+    if not prices:
+        return "has tolls (price unknown)"
+    parts = []
+    for p in prices:
+        amount = int(p.get("units", 0)) + p.get("nanos", 0) / 1e9
+        parts.append(f"{p.get('currencyCode', '')} {amount:.2f}".rstrip("0").rstrip("."))
+    return " + ".join(parts)
+
+
+def _weather_brief(d: dict[str, Any]) -> dict[str, Any]:
+    """The few fields worth saying out loud while driving."""
+    cond = (d.get("weatherCondition") or {}).get("description", {}).get("text")
+    precip = (d.get("precipitation") or {}).get("probability", {}).get("percent")
+    out: dict[str, Any] = {
+        "conditions": cond,
+        "temperature_c": (d.get("temperature") or {}).get("degrees"),
+        "feels_like_c": (d.get("feelsLikeTemperature") or {}).get("degrees"),
+        "chance_of_rain_pct": precip,
+        "wind_kmh": ((d.get("wind") or {}).get("speed") or {}).get("value"),
+        "visibility_km": ((d.get("visibility") or {}).get("distance")),
+    }
+    if (d.get("interval") or {}).get("startTime"):
+        out["for_time"] = d["interval"]["startTime"]
+    return {k: v for k, v in out.items() if v is not None}

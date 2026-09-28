@@ -10,12 +10,6 @@ const EVIDENCE_LABELS: Record<string, string> = {
   reviewed: "Loved in reviews",
   likely: "Likely serves it",
 };
-const QUOTE_SOURCES: Record<string, string> = {
-  review: "Google review",
-  menu: "Menu (web)",
-  summary: "Google review summary",
-  web: "Website",
-};
 
 /** Where it is, relative to what the driver cares about: drive time (EV), walk (parking) or distance. */
 function where(p: Place) {
@@ -126,15 +120,15 @@ export default function ResultCards({ places, onNavigate, onFocus, scrollTo, ref
         {places.map((p, i) => {
           const rankIndex = i - pinnedCount;
           const top = !p.pinned && rankIndex === 0;
-          const rank = p.pinned ? "Destination" : top ? "Top pick" : `No. ${rankIndex + 1}`;
           const badge: Badge | null =
             p.badge ?? (p.evidence && EVIDENCE_LABELS[p.evidence] ? { text: EVIDENCE_LABELS[p.evidence], tone: p.evidence } : null);
           const loc = where(p);
           // Drop chips that repeat the meta row (e.g. "4 min walk").
           const dup = (t: string) => /min (walk|drive)/i.test(t);
-          const chips = [badge, ...(p.tags ?? []).map((t) => ({ text: t, tone: "neutral" }))]
+          const lead: Badge | null = p.pinned ? { text: "At your destination", tone: "lead" } : top ? { text: "Best match", tone: "lead" } : null;
+          const chips = [lead, badge, ...(p.tags ?? []).map((t) => ({ text: t, tone: "neutral" }))]
             .filter((c): c is Badge => !!c && !dup(c.text))
-            .slice(0, 3);
+            .slice(0, 2);
           const isParking = p.walk_min != null;
           const Where = loc.icon;
           return (
@@ -160,7 +154,6 @@ export default function ResultCards({ places, onNavigate, onFocus, scrollTo, ref
                   )}
                 </div>
                 <div className="card-main">
-                  <div className={`card-kicker${top ? " top" : p.pinned ? " dest" : ""}`}>{rank}</div>
                   <div className="card-title">{cleanName(p.name)}</div>
                   <div className="card-meta">
                     {p.rating ? (
@@ -186,12 +179,6 @@ export default function ResultCards({ places, onNavigate, onFocus, scrollTo, ref
                   ))}
                 </div>
               )}
-              {p.quote && (
-                <p className="card-quote" title={`${QUOTE_SOURCES[p.quote_source ?? ""] ?? "Google Maps"}${p.quote_author ? ` · ${p.quote_author}` : ""}`}>
-                  “{p.quote}”
-                </p>
-              )}
-
               <div className="card-actions">
                 <button className="go" onClick={() => onNavigate(p)}>
                   <Navigation size={14} /> Navigate
