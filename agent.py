@@ -278,7 +278,9 @@ class KenDrive(Agent):
             raise ToolError(str(e)) from e
         if not places:
             return {"result": f"No {category} found within 6 km."}
-        await self.s.push_ui({"type": "places", "category": category, "places": places})
+        # Title from what was asked for ("Coffee nearby"), not the broad category ("Restaurants nearby").
+        title = f"{keyword.strip().capitalize()} nearby" if keyword and keyword.strip() else None
+        await self.s.push_ui({"type": "places", "category": category, "title": title, "places": places})
         return {
             "places": [
                 {

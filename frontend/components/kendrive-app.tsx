@@ -290,6 +290,7 @@ export default function KenDriveApp() {
     (evt: UiEvent) => {
       const ctl = mapRef.current;
       if (evt.type === "places") {
+        setWeather(null); // the dock shows the newest card only
         setResults({ title: evt.title ?? CATEGORY_TITLES[evt.category] ?? CATEGORY_TITLES.other, category: evt.category, places: evt.places });
         try {
           ctl?.showPlaces(evt.places, evt.category, locRef.current);
@@ -298,6 +299,7 @@ export default function KenDriveApp() {
         }
         setMapView((v) => (v === "hidden" ? "card" : v));
       } else if (evt.type === "route") {
+        setWeather(null);
         const c = evt.chosen;
         let path: LatLng[] = [];
         try {
@@ -462,7 +464,8 @@ export default function KenDriveApp() {
             </div>
           )}
           {weather && <WeatherCard weather={weather} onClose={() => setWeather(null)} />}
-          {results && mapView !== "expanded" && (
+          {/* Weather sits on top of the route / results; closing it brings them back. */}
+          {results && !weather && mapView !== "expanded" && (
             <ResultCards
               ref={cardsRef}
               places={results.places}
@@ -471,7 +474,7 @@ export default function KenDriveApp() {
               scrollTo={pinFocus}
             />
           )}
-          {route && !results && (
+          {route && !results && !weather && (
             <div className="route-card" ref={routeCardRef}>
               <div className="route-main">
                 <div>
