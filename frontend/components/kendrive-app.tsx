@@ -2,7 +2,7 @@
 
 import { LiveKitRoom } from "@livekit/components-react";
 import { Maximize2, Minimize2, X } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { fmtDist, fmtDur } from "@/lib/format";
 import { MapController } from "@/lib/map-controller";
 import type { LatLng, Loc, OrbState, Place, UiEvent } from "@/lib/types";
@@ -73,6 +73,9 @@ export default function KenDriveApp() {
   const phoneRef = useRef<HTMLDivElement>(null);
   const topbarRef = useRef<HTMLElement>(null);
   const orbRef = useRef<HTMLButtonElement>(null);
+  const stageRef = useRef<HTMLElement>(null);
+  const dockRef = useRef<HTMLDivElement>(null);
+  const mapCardRef = useRef<HTMLElement>(null);
   const mapElRef = useRef<HTMLDivElement>(null);
   const cardsRef = useRef<HTMLElement>(null);
   const routeCardRef = useRef<HTMLDivElement>(null);
@@ -349,11 +352,45 @@ export default function KenDriveApp() {
     return { title: "Map", sub: "Your location" };
   }, [results, route]);
 
+  // ---------------------------------------------------------------- compact layout
+  // While cards are up, shrink the orb and centre it + the captions in the space that's actually free:
+  // between the top (or the map card, when it's showing) and the top of the dock. Measured, not guessed,
+  // so it holds on any screen and whether or not the map is available.
+  const compact = mapView !== "hidden" || !!results || !!route;
+  const mapShown = mapReady && mapView === "card";
+  useLayoutEffect(() => {
+    const stage = stageRef.current;
+    const dock = dockRef.current;
+    if (!stage || !dock || !compact) return;
+    const place = () => {
+      const stageTop = stage.offsetTop;
+      const barSpace = 92; // matches --bar-space
+      const natural = (stage.offsetHeight - barSpace) / 2; // the orb's resting centre
+      const map = mapCardRef.current;
+      const top = (mapShown && map ? map.offsetTop + map.offsetHeight : stageTop) - stageTop + 14;
+      const bottom = dock.offsetTop + (dock.firstElementChild as HTMLElement | null)!.offsetTop - stageTop - 14;
+      const captions = 84; // status line + two short caption lines
+      const room = bottom - top;
+      const scale = Math.max(0.36, Math.min(0.62, (room - captions - 14) / 208));
+      const r = 104 * scale;
+      const cy = top + Math.max(0, (room - (2 * r + 14 + captions)) / 2) + r;
+      stage.style.setProperty("--orb-shift", `${Math.round(cy - natural)}px`);
+      stage.style.setProperty("--orb-scale", scale.toFixed(3));
+      stage.style.setProperty("--below-top", `${Math.round(cy + r + 14)}px`);
+    };
+    place();
+    const ro = new ResizeObserver(place);
+    ro.observe(stage);
+    ro.observe(dock);
+    return () => ro.disconnect();
+  }, [compact, mapShown, results, route, live, conn]);
+
   return (
     <div className="phone" ref={phoneRef} data-map={mapView}>
       {/* Floating map card: outside the room, which remounts its children on connect (Leaflet must keep its element). */}
       <section
         className="float-map"
+        ref={mapCardRef}
         data-view={mapReady ? mapView : "hidden"}
         aria-hidden={!mapReady || mapView === "hidden"}
         aria-label="Map"
@@ -392,14 +429,14 @@ export default function KenDriveApp() {
         <TopBar ref={topbarRef} />
 
         {/* The orb, with the intro before a call and live captions during one. It shrinks while cards float in. */}
-        <main className="stage" data-compact={mapView !== "hidden" || !!results || !!route || undefined}>
+        <main className="stage" ref={stageRef} data-compact={compact || undefined}>
           {orbState === "idle" && <Hero onPrompt={(t) => void say(t)} />}
           <VoiceOrb ref={orbRef} state={orbState} onTap={onOrbTap} />
-          <LiveCaptions state={orbState} compact={mapView !== "hidden" || !!results || !!route} />
+          <LiveCaptions state={orbState} compact={compact} />
         </main>
 
         {/* Bottom dock: notices, results and the route float in above the call bar, then go. */}
-        <div className="dock">
+        <div className="dock" ref={dockRef}>
           {toast && (
             <div className={`toast ${toast.kind}`} key={toast.id} role="status">
               {toast.text}
