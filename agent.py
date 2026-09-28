@@ -824,10 +824,16 @@ class KenDrive(Agent):
                 out = await self.s.maps.weather_at((d["lat"], d["lng"]), eta_h)
                 out["place"] = d["name"]
                 out["arriving_in"] = fmt_dur(self.s.route.duration_s)
-                return out
-            return await self.s.maps.weather_now(self.s.location())
+                title = f"{d['name']} when you arrive"
+            else:
+                loc = self.s.location()
+                out, area = await asyncio.gather(self.s.maps.weather_now(loc), self.s.maps.locality(loc))
+                out["place"] = area or "Here"
+                title = f"Now in {area}" if area else "Weather here"
         except MapsError as e:
             raise ToolError(str(e)) from e
+        await self.s.push_ui({"type": "weather", "title": title, **out})
+        return {k: v for k, v in out.items() if k != "icon"}
 
     @function_tool
     async def where_am_i(self, ctx: RunContext) -> dict[str, Any]:

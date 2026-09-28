@@ -6,7 +6,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { fmtDist, fmtDur } from "@/lib/format";
 import { MapController } from "@/lib/map-controller";
 import { useThinkingSound } from "@/lib/use-thinking-sound";
-import type { LatLng, Loc, OrbState, Place, UiEvent } from "@/lib/types";
+import type { LatLng, Loc, OrbState, Place, UiEvent, WeatherEvent } from "@/lib/types";
 import ResultCards from "./result-cards";
 import SessionBridge, { type SessionApi } from "./session-bridge";
 import ConversationBar from "./conversation-bar";
@@ -14,6 +14,7 @@ import Hero from "./hero";
 import LiveCaptions from "./live-captions";
 import TopBar from "./top-bar";
 import VoiceOrb from "./voice-orb";
+import WeatherCard from "./weather-card";
 
 // Demo locations. Dubai has no open live-parking feed; Singapore publishes live car-park availability.
 // Live GPS by default; ?demo (Dubai) or ?demo=singapore pins a demo location.
@@ -88,12 +89,13 @@ export default function KenDriveApp() {
   const [connecting, setConnecting] = useState(false);
   const [live, setLive] = useState(false);
   const [agentState, setAgentState] = useState("idle");
-  const [paused, setPaused] = useState(false);
+  const [micMuted, setMicMuted] = useState(false); // the driver's mic only; KenDrive keeps talking
   const [micAvailable, setMicAvailable] = useState(true);
   const [locMode, setLocMode] = useState<LocMode>(initialLocMode);
   const [trackedLoc, setTrackedLoc] = useState<Loc | null>(null); // from GPS
   const [results, setResults] = useState<{ title: string; category: string; places: Place[] } | null>(null);
   const [route, setRoute] = useState<RouteState | null>(null);
+  const [weather, setWeather] = useState<WeatherEvent | null>(null);
   // The map floats in as a card when there's something to show (results or a route); tap to expand it.
   const [mapView, setMapView] = useState<"hidden" | "card" | "expanded">("hidden");
   const [toast, setToast] = useState<Toast | null>(null);
@@ -229,18 +231,19 @@ export default function KenDriveApp() {
     setLive(false);
     setConn(null);
     setConnecting(false);
-    setPaused(false);
+    setMicMuted(false);
     setAgentState("idle");
+    setWeather(null);
   }, [showToast]);
   const onMediaDeviceFailure = useCallback(() => {
     setMicAvailable(false);
     showToast("Can't reach your microphone. You can type instead.");
   }, [showToast]);
 
-  // Tap the orb: start a session, then pause / resume it.
+  // Tap the orb: start a session, then mute / unmute the mic.
   const onOrbTap = useCallback(() => {
     if (connecting) return;
-    if (live) setPaused((p) => !p);
+    if (live) setMicMuted((m) => !m);
     else void startSession();
   }, [connecting, live, startSession]);
 
@@ -249,7 +252,7 @@ export default function KenDriveApp() {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "m" && e.key !== "M") return;
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
-      if (live) setPaused((p) => !p);
+      if (live) setMicMuted((m) => !m);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -258,7 +261,6 @@ export default function KenDriveApp() {
   const say = useCallback(
     async (msg: string) => {
       if (!msg.trim()) return;
-      setPaused(false);
       if (!live) await startSession();
       await apiRef.current?.sendText(msg);
     },
@@ -269,13 +271,13 @@ export default function KenDriveApp() {
     ? connecting || conn
       ? "connecting"
       : "idle"
-    : paused
-      ? "paused"
-      : agentState === "listening"
-        ? micAvailable
-          ? "listening"
-          : "muted"
-        : agentState === "thinking"
+    : agentState === "listening"
+      ? !micAvailable
+        ? "muted"
+        : micMuted
+          ? "paused" // waiting for the driver, but their mic is off
+          : "listening"
+      : agentState === "thinking"
           ? "thinking"
           : agentState === "speaking"
             ? "speaking"
@@ -315,6 +317,8 @@ export default function KenDriveApp() {
           detail: `To ${evt.destination.name} · ${c.summary || "fastest route"} · ${traffic}`,
         });
         setMapView((v) => (v === "hidden" ? "card" : v));
+      } else if (evt.type === "weather") {
+        setWeather(evt);
       } else if (evt.type === "clear_route") {
         ctl?.clearRoute();
         setRoute(null);
@@ -359,7 +363,7 @@ export default function KenDriveApp() {
   // While cards are up, shrink the orb and centre it + the captions in the space that's actually free:
   // between the top (or the map card, when it's showing) and the top of the dock. Measured, not guessed,
   // so it holds on any screen and whether or not the map is available.
-  const compact = mapView !== "hidden" || !!results || !!route;
+  const compact = mapView !== "hidden" || !!results || !!route || !!weather;
   const mapShown = mapReady && mapView === "card";
   useLayoutEffect(() => {
     const stage = stageRef.current;
@@ -386,7 +390,7 @@ export default function KenDriveApp() {
     ro.observe(stage);
     ro.observe(dock);
     return () => ro.disconnect();
-  }, [compact, mapShown, results, route, live, conn]);
+  }, [compact, mapShown, results, route, weather, live, conn]);
 
   return (
     <div className="phone" ref={phoneRef} data-map={mapView}>
@@ -457,6 +461,7 @@ export default function KenDriveApp() {
               )}
             </div>
           )}
+          {weather && <WeatherCard weather={weather} onClose={() => setWeather(null)} />}
           {results && mapView !== "expanded" && (
             <ResultCards
               ref={cardsRef}
@@ -485,8 +490,8 @@ export default function KenDriveApp() {
           <ConversationBar
             live={live}
             connecting={connecting || (!!conn && !live)}
-            muted={paused}
-            onToggleMute={() => setPaused((p) => !p)}
+            muted={micMuted}
+            onToggleMute={() => setMicMuted((m) => !m)}
             onCall={() => void startSession()}
             onEnd={endSession}
             onSend={(t) => void say(t)}
@@ -495,7 +500,7 @@ export default function KenDriveApp() {
 
         <SessionBridge
           loc={loc}
-          paused={paused}
+          micMuted={micMuted}
           micAvailable={micAvailable}
           onAgentState={setAgentState}
           onUiEvent={onUiEvent}

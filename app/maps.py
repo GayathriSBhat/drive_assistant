@@ -565,7 +565,8 @@ def _toll_text(advisory: dict[str, Any]) -> str:
 
 def _weather_brief(d: dict[str, Any]) -> dict[str, Any]:
     """The few fields worth saying out loud while driving."""
-    cond = (d.get("weatherCondition") or {}).get("description", {}).get("text")
+    wc = d.get("weatherCondition") or {}
+    cond = wc.get("description", {}).get("text")
     precip = (d.get("precipitation") or {}).get("probability", {}).get("percent")
     out: dict[str, Any] = {
         "conditions": cond,
@@ -575,6 +576,8 @@ def _weather_brief(d: dict[str, Any]) -> dict[str, Any]:
         "wind_kmh": ((d.get("wind") or {}).get("speed") or {}).get("value"),
         "visibility_km": ((d.get("visibility") or {}).get("distance")),
     }
+    if wc.get("iconBaseUri"):
+        out["icon"] = wc["iconBaseUri"] + "_dark.svg"  # Google's condition icon, dark-theme variant
     if (d.get("interval") or {}).get("startTime"):
         out["for_time"] = d["interval"]["startTime"]
     return {k: v for k, v in out.items() if v is not None}

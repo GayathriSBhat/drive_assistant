@@ -12,7 +12,7 @@ export interface SessionApi {
 
 interface Props {
   loc: Loc | null;
-  paused: boolean;
+  micMuted: boolean;
   micAvailable: boolean;
   onAgentState: (state: string) => void;
   onUiEvent: (evt: UiEvent) => void;
@@ -25,7 +25,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
  * Lives inside <LiveKitRoom>: mirrors agent state out, receives the agent's UI events, shares the
  * driver's location as participant attributes, applies pause, and plays KenDrive's voice.
  */
-export default function SessionBridge({ loc, paused, micAvailable, onAgentState, onUiEvent, onReady }: Props) {
+export default function SessionBridge({ loc, micMuted, micAvailable, onAgentState, onUiEvent, onReady }: Props) {
   const room = useRoomContext();
   const connection = useConnectionState();
   const { state } = useVoiceAssistant();
@@ -99,8 +99,8 @@ export default function SessionBridge({ loc, paused, micAvailable, onAgentState,
   // Mute = the driver's mic only. KenDrive keeps talking (a muted mic shouldn't silence the answer).
   useEffect(() => {
     if (connection !== ConnectionState.Connected || !micAvailable) return;
-    room.localParticipant.setMicrophoneEnabled(!paused).catch((e) => console.warn("mic", e));
-  }, [paused, micAvailable, connection, room]);
+    room.localParticipant.setMicrophoneEnabled(!micMuted).catch((e) => console.warn("mic", e));
+  }, [micMuted, micAvailable, connection, room]);
 
   // Expose sendText to the app.
   useEffect(() => {

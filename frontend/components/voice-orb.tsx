@@ -23,7 +23,7 @@ const LABELS: Record<OrbState, string> = {
   thinking: "Thinking...",
   speaking: "Speaking...",
   muted: "Mic unavailable — type below",
-  paused: "Muted · tap to unmute",
+  paused: "Your mic is off · tap to turn it on",
 };
 
 interface Props {

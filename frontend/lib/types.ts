@@ -63,8 +63,24 @@ export interface RouteEvent {
 }
 
 /** UI updates the agent streams on the "ui.event" text-stream topic. */
+/** The weather tool's card: now at the driver, or at the destination at the ETA. */
+export interface WeatherEvent {
+  type: "weather";
+  title: string;
+  place?: string;
+  conditions?: string;
+  temperature_c?: number;
+  feels_like_c?: number;
+  chance_of_rain_pct?: number;
+  wind_kmh?: number;
+  visibility_km?: number;
+  icon?: string;
+  arriving_in?: string;
+}
+
 export type UiEvent =
   | { type: "places"; category: string; title?: string; places: Place[] }
+  | WeatherEvent
   | RouteEvent
   | { type: "clear_route" }
   | { type: "focus_reports" };
