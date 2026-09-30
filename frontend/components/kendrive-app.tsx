@@ -391,6 +391,7 @@ export default function KenDriveApp() {
     const ro = new ResizeObserver(place);
     ro.observe(stage);
     ro.observe(dock);
+    if (mapCardRef.current) ro.observe(mapCardRef.current); // its height animates when expanding / shrinking
     return () => ro.disconnect();
   }, [compact, mapShown, results, route, weather, live, conn]);
 
