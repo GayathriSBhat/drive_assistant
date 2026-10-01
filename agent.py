@@ -78,17 +78,24 @@ CITY_ALIASES = {"bengaluru": ("bangalore",), "mumbai": ("bombay",), "chennai": (
 INSTRUCTIONS = """You are a voice co-pilot for someone who is DRIVING right now (India or the UAE).
 Style: calm, brief, spoken. One to three short sentences. No lists, no markdown, no URLs, no
 coordinates. Round distances ("about 800 metres", "2.4 kilometres") and times ("12 minutes").
-When the session starts, greet the driver with exactly these words, and nothing more: Hi, I am your assistant. How can I help you today?
+When the session starts, your very first word must be مرحباً and the whole greeting must be exactly this,
+nothing before it and nothing after it: مرحباً، أنا مساعدك. شو أقدر أساعدك فيه اليوم؟
+Never say "Hi", "Hello", "هلا" or any other word in place of مرحباً, never add a preamble or title (no
+"البث المباشر" or similar), and do not translate the greeting.
 The driver may ask about parking, fuel, EV charging, food, routes or traffic ahead.
 Only ever say words meant for the driver. Never read out instructions, plans, steps, tool names or
 parameters — call the tool silently, then tell the driver the result.
 Understand local usage: "petrol bunk" = fuel station, "signal" = traffic light, "Salik" = Dubai toll gate.
-Reply in the language the driver speaks. When they speak Arabic, reply in the same dialect they use
-(Emirati, other Gulf, Egyptian, Levantine, Iraqi, Moroccan…) and keep to it for the whole conversation,
-even in longer answers — never Modern Standard Arabic. If you can't tell the dialect, use Emirati
-(اللهجة الإماراتية). Everyday Emirati words: شو (what), وايد (a lot), الحين (now), زين (good),
-أبا / تبا (I want / you want), دوّار (roundabout), إشارة (traffic light), بترول (fuel), باركن (parking),
-سيده (straight on), كيلو (km). Keep place names, road names and brand names as they are.
+Language: Arabic by default, in the Emirati dialect (اللهجة الإماراتية). Speak Arabic until the driver
+clearly speaks another language (English, Hindi, …); then reply in the language of the driver's latest
+message and switch whenever they switch, including back to Arabic. An English place name like Dubai Mall
+inside Arabic speech is not a language switch, and an Arabic place name inside English speech is not either.
+The Emirati greeting is only the opener: from the driver's first Arabic words onward, match their dialect
+(Emirati, other Gulf, Egyptian, Levantine, Iraqi, Moroccan…) and stay in it, never Modern Standard Arabic,
+even in longer answers; if you can't tell the dialect, keep using Emirati. Everyday
+Emirati words: شو (what), وايد (a lot), الحين (now), زين (good), أبا / تبا (I want / you want),
+دوّار (roundabout), إشارة (traffic light), بترول (fuel), باركن (parking), سيده (straight on), كيلو (km).
+Keep place names, road names and brand names as they are.
 
 Always use tools instead of guessing:
 - EV charging ("charger", "charge my car", "low battery") → find_ev_chargers. If they mention battery %
@@ -109,6 +116,9 @@ Always use tools instead of guessing:
   words ("it's on their menu", "reviewers rave about the bolognese"). Never recommend a place whose
   evidence is "no".
 {routing_rules}
+- A route from somewhere other than where they are ("from the airport to X") → plan_route with that start
+  as origin; give the time and distance rather than turns. Never say a route starts anywhere other than
+  the result's "from".
 - Local events, festivals, diversions, news, general questions → web_search.
 - Questions about a specific place (reviews, is it good, what's it known for) → ask_google_maps.
 For medical emergencies, give the nearest hospital and remind them to call an ambulance: 108 in
@@ -138,6 +148,7 @@ class DriveState:
     http: httpx.AsyncClient
     route: Route | None = None
     destination: dict[str, Any] | None = None
+    origin: dict[str, Any] | None = None  # where the route starts if the driver named a place; None = their position
     stops: list[dict[str, Any]] = field(default_factory=list)  # waypoints added on the way, in order
     avoid: set[str] = field(default_factory=set)  # route preferences: tolls / highways / ferries
     stop_candidates: list[dict[str, Any]] = field(default_factory=list)  # last find_stop_on_route results
@@ -155,6 +166,10 @@ class DriveState:
         if p and p.attributes.get("lat") and p.attributes.get("lng"):
             return float(p.attributes["lat"]), float(p.attributes["lng"])
         raise ToolError("I don't have the driver's location yet. Ask them to allow location access in the app.")
+
+    def route_start(self) -> LatLng:
+        """Where the active route starts: the place the driver named, else their current position."""
+        return (self.origin["lat"], self.origin["lng"]) if self.origin else self.location()
 
     def heading(self) -> float | None:
         p = self.driver()
@@ -367,13 +382,12 @@ class KenDrive(Agent):
             vehicle: "two_wheeler" for e-scooters/bikes (includes slow sockets); otherwise "car".
             range_km: Remaining driving range in km, if the driver said (e.g. from battery %).
         """
-        loc = self.s.location()
         route = self.s.route if along_route else None
         if along_route and not route:
             along_route = False
         try:
             chargers = await find_chargers(
-                self.s.maps, loc,
+                self.s.maps, self.s.route_start() if route else self.s.location(),
                 route_path=route.path if route else None,
                 route_duration_s=route.duration_s if route else None,
                 vehicle=vehicle, connector=connector, fast_only=fast_only, range_km=range_km,
@@ -500,25 +514,33 @@ class KenDrive(Agent):
         }
 
     @function_tool
-    async def plan_route(self, ctx: RunContext, destination: str) -> dict[str, Any]:
+    async def plan_route(self, ctx: RunContext, destination: str, origin: str | None = None) -> dict[str, Any]:
         """Plan a driving route to a destination (avoiding roads other drivers reported as blocked, when enabled).
         Shows the route on the driver's map and makes it the active route.
 
         Args:
             destination: Place name or address, e.g. "Koramangala", "Manipal Hospital Old Airport Road",
                 or the name of a place returned by find_nearby.
+            origin: Starting point, only when the driver names one ("from the airport to Koramangala").
+                Leave empty to start from the driver's current location.
         """
-        origin = self.s.location()
         try:
-            dest = await self.s.maps.geocode(destination, near=origin)
+            here = self.s.location()
+        except ToolError:
+            if not origin:
+                raise
+            here = None
+        try:
+            start = await self.s.maps.geocode(origin, near=here) if origin else None
+            dest = await self.s.maps.geocode(destination, near=(start["lat"], start["lng"]) if start else here)
         except MapsError as e:
             raise ToolError(str(e)) from e
-        self.s.stops = []
+        self.s.origin, self.s.stops = start, []
         return await self._route_to(dest)
 
     async def _route_to(self, dest: dict[str, Any]) -> dict[str, Any]:
         """(Re)plan to `dest` via the current stops and route preferences; show it and make it active."""
-        origin = self.s.location()
+        origin = self.s.route_start()
         stop_pts = [(st["lat"], st["lng"]) for st in self.s.stops]
         try:
             routes = await self.s.maps.routes(origin, (dest["lat"], dest["lng"]), stops=stop_pts, avoid=frozenset(self.s.avoid))
@@ -544,6 +566,7 @@ class KenDrive(Agent):
         await self.s.push_ui(
             {
                 "type": "route",
+                "origin": self.s.origin,
                 "destination": dest,
                 "chosen": chosen.to_ui(),
                 "alternatives": [r.to_ui() for r in others],
@@ -551,7 +574,9 @@ class KenDrive(Agent):
             }
         )
 
+        o = self.s.origin
         result: dict[str, Any] = {
+            "from": f'{o["name"]}, {o["address"]}' if o else "the driver's current location",
             "destination": f'{dest["name"]}, {dest["address"]}',
             "eta": fmt_dur(chosen.duration_s),
             "distance": fmt_dist(chosen.distance_m),
@@ -586,7 +611,9 @@ class KenDrive(Agent):
         out: dict[str, Any] = {}
 
         if self.s.route:
-            _, my_idx = distance_to_path(loc, self.s.route.path)
+            off_m, my_idx = distance_to_path(loc, self.s.route.path)
+            if self.s.origin and off_m > 1000:
+                my_idx = 0  # a route from somewhere else that the driver isn't on yet: check all of it
             ahead = blockages_on(self.s.route, reports, start_idx=my_idx)
             if ROAD_REPORTS:
                 out["on_your_route"] = [report_brief(b, b["along_m"]) for b in ahead] or "No driver reports on your route."
@@ -703,16 +730,16 @@ class KenDrive(Agent):
         query, ptype = STOP_KINDS[kind]
         if not (keyword or query):
             raise ToolError("Say what kind of stop, e.g. a keyword like 'car wash'.")
-        loc = self.s.location()
+        start = self.s.route_start()
         try:
             found = await self.s.maps.search_along_route(
-                keyword or query, ptype, route.path, loc, PLACE_FIELDS, limit=12
+                keyword or query, ptype, route.path, start, PLACE_FIELDS, limit=12
             )
         except MapsError as e:
             raise ToolError(str(e)) from e
         cards = []
         for raw, summary in found:
-            card = self.s.maps.place(raw, loc)
+            card = self.s.maps.place(raw, start)
             legs = summary.get("legs", [])
             if len(legs) >= 2:
                 via_s = sum(float(leg.get("duration", "0s").rstrip("s")) for leg in legs)
@@ -747,7 +774,7 @@ class KenDrive(Agent):
         stop = next((c for c in self.s.stop_candidates if name in c["name"].lower() or c["name"].lower() in name), None)
         if stop is None:
             try:
-                stop = await self.s.maps.geocode(place_name, near=self.s.location())
+                stop = await self.s.maps.geocode(place_name, near=self.s.route_start())
             except MapsError as e:
                 raise ToolError(str(e)) from e
         self.s.stops.append({"name": stop["name"], "lat": stop["lat"], "lng": stop["lng"]})
@@ -868,7 +895,7 @@ class KenDrive(Agent):
     @function_tool
     async def clear_route(self, ctx: RunContext) -> str:
         """Cancel the active route / navigation."""
-        self.s.route = self.s.destination = None
+        self.s.route = self.s.destination = self.s.origin = None
         await self.s.push_ui({"type": "clear_route"})
         return "Route cleared."
 
@@ -933,7 +960,7 @@ async def entrypoint(ctx: JobContext) -> None:
         llm=google.realtime.RealtimeModel(
             model=GEMINI_LIVE_MODEL,
             api_key=GEMINI_API_KEY,
-            voice=os.getenv("GEMINI_VOICE", "Puck"),
+            voice=os.getenv("GEMINI_VOICE", "Kore"),  # female voice; Gemini voices are multilingual (Arabic ok)
         )
     )
 

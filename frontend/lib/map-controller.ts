@@ -1,6 +1,6 @@
 /// <reference types="google.maps" />
 import { decodePolyline } from "./format";
-import type { LatLng, Loc, Place, RouteEvent } from "./types";
+import type { Destination, LatLng, Loc, Place, RouteEvent } from "./types";
 
 const CATEGORY_COLORS: Record<string, string> = {
   fuel: "#e8935c",
@@ -136,15 +136,15 @@ export class MapController {
     for (const alt of evt.alternatives) this.routeLayers.push(line(decodePolyline(alt.polyline), "#3a3c42", 5, 0.8));
     const path = decodePolyline(evt.chosen.polyline);
     this.routeLayers.push(line(path, "#08090a", 10, 0.9, 2), line(path, "#edaa57", 6, 1, 3));
-    const d = evt.destination;
-    this.routeLayers.push(
+    const pin = (p: Destination, cls: string) =>
       new google.maps.marker.AdvancedMarkerElement({
         map: this.map,
-        position: { lat: d.lat, lng: d.lng },
-        content: el('<div class="dest-pin"></div>'),
-        title: d.name,
-      }),
-    );
+        position: { lat: p.lat, lng: p.lng },
+        content: el(`<div class="${cls}"></div>`),
+        title: p.name,
+      });
+    this.routeLayers.push(pin(evt.destination, "dest-pin"));
+    if (evt.origin) this.routeLayers.push(pin(evt.origin, "origin-pin"));
     this.clearPlaces();
     this.lastFit = path;
     return path;

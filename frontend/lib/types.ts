@@ -56,6 +56,7 @@ export interface Destination {
 
 export interface RouteEvent {
   type: "route";
+  origin?: Destination | null; // set when the route starts somewhere other than the driver
   destination: Destination;
   chosen: RouteInfo;
   alternatives: RouteInfo[];

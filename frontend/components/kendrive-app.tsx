@@ -309,14 +309,15 @@ export default function KenDriveApp() {
         }
         const traffic =
           c.traffic_delay_s == null ? "free-flow ETA" : c.traffic_delay_s > 60 ? `+${fmtDur(c.traffic_delay_s)} traffic` : "light traffic";
+        const from = evt.origin ? `From ${evt.origin.name}` : "";
         setResults(null);
         setRoute({
           path,
           title: `${fmtDur(c.duration_s)} to ${evt.destination.name}`,
-          sub: `${fmtDist(c.distance_m)} · ${c.summary || "fastest route"}`,
+          sub: `${from ? `${from} · ` : ""}${fmtDist(c.distance_m)} · ${c.summary || "fastest route"}`,
           eta: fmtDur(c.duration_s),
           distance: fmtDist(c.distance_m),
-          detail: `To ${evt.destination.name} · ${c.summary || "fastest route"} · ${traffic}`,
+          detail: `${from ? `${from} to` : "To"} ${evt.destination.name} · ${c.summary || "fastest route"} · ${traffic}`,
         });
         setMapView((v) => (v === "hidden" ? "card" : v));
       } else if (evt.type === "weather") {
