@@ -9,8 +9,8 @@ const serif = Fraunces({ variable: "--font-serif", subsets: ["latin"], style: ["
 const mono = Fragment_Mono({ variable: "--font-mono", subsets: ["latin"], weight: "400" });
 
 export const metadata: Metadata = {
-  title: "KenDrive",
-  description: "A hands-free co-pilot: fuel, parking, chargers and traffic, just by asking.",
+  title: "Aween",
+  description: "Aween, a hands-free voice assistant. Just ask.",
 };
 
 export const viewport: Viewport = {

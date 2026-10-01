@@ -34,7 +34,7 @@ uv run agent.py dev --log-level info &
 AGENT=$!
 (cd frontend && exec npm run dev -- --port 3000) &
 WEB=$!
-echo; echo "  KenDrive → http://localhost:3000  (?demo = Dubai, ?demo=singapore = Singapore with live parking)"
+echo; echo "  Aween → http://localhost:3000  (?demo = Dubai, ?demo=singapore = Singapore with live parking)"
 echo "  LiveKit server logs → data/livekit.log"; echo
 
 # Watch the four services (macOS bash 3.2 has no `wait -n`).

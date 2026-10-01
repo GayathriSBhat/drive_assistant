@@ -8,7 +8,7 @@ const STATUS: Partial<Record<OrbState, string>> = {
   connecting: "Connecting",
   listening: "Listening",
   thinking: "Looking into it",
-  speaking: "KenDrive",
+  speaking: "Aween",
   muted: "No mic — type instead",
   paused: "Your mic is off",
 };

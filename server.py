@@ -43,7 +43,7 @@ MAX_PHOTO_BYTES = 8 * 1024 * 1024
 ROAD_REPORTS = os.getenv("ENABLE_ROAD_REPORTS", "false").lower() in ("1", "true", "yes")
 
 maps = Maps(os.environ["GOOGLE_PLACES_API_KEY"])
-app = FastAPI(title="KenDrive")
+app = FastAPI(title="Aween")
 
 
 # ---------------------------------------------------------------- reports store

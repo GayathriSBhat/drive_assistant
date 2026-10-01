@@ -160,7 +160,7 @@ export default function KenDriveApp() {
       } else if ((await gpsPermission()) === "denied") {
         showToast("Location is off for this site. Turn it on in your browser settings, then try again.", "info", retry);
       } else {
-        showToast("KenDrive works best with your location. Showing Dubai for now.", "info", retry);
+        showToast("Aween works best with your location. Showing Dubai for now.", "info", retry);
       }
     },
     [showToast],

@@ -34,7 +34,7 @@ interface Props {
 
 /** The only voice control: tap to start a session, then tap to pause / resume it. */
 export default function VoiceOrb({ state, onTap, ref }: Props) {
-  const label = `KenDrive: ${LABELS[state]}`;
+  const label = `Aween: ${LABELS[state]}`;
   return (
     <button ref={ref} className="orb" data-state={state} aria-label={label} title={label} onClick={onTap}>
       <Persona state={PERSONA_STATE[state]} className="persona" />

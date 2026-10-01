@@ -59,7 +59,7 @@ export default function ConversationBar({ live, connecting, muted, onToggleMute,
           {active ? (
             <BarVisualizer state={connecting ? "connecting" : state} track={audioTrack} barCount={14} options={{ minHeight: 12 }} />
           ) : (
-            <ShimmeringText text="KenDrive" duration={3} className="convo-name" />
+            <ShimmeringText text="Aween" duration={3} className="convo-name" />
           )}
         </div>
 
