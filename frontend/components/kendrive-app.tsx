@@ -232,7 +232,6 @@ export default function KenDriveApp() {
     setConnecting(false);
   }, []);
   const onDisconnected = useCallback(() => {
-    if (liveRef.current) showToast("Call ended. Tap the orb whenever you need me.");
     setLive(false);
     setConn(null);
     setConnecting(false);
@@ -247,7 +246,7 @@ export default function KenDriveApp() {
     mapRef.current?.clearPlaces();
     mapRef.current?.clearRoute();
     mapRef.current?.setFit(null);
-  }, [showToast]);
+  }, []);
   const onMediaDeviceFailure = useCallback(() => {
     setMicAvailable(false);
     showToast("Can't reach your microphone. You can type instead.");

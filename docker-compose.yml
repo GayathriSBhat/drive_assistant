@@ -45,6 +45,8 @@ services:
       context: ./frontend
       args:
         KENDRIVE_API_ORIGIN: http://api:8000
+        # Browser key for the Maps JavaScript API (read from .env); without it the app shows cards but no map.
+        NEXT_PUBLIC_GOOGLE_MAPS_KEY: ${NEXT_PUBLIC_GOOGLE_MAPS_KEY:-}
     ports:
       - "3000:3000"
     depends_on: [api]

@@ -131,6 +131,10 @@ When a request matches one of these, use the tool instead of guessing:
   It already knows today's date and the user's city. Only mention items the result says are current or
   upcoming, with their day and venue; never invent events or dates.
 - Questions about a specific place (reviews, is it good, what's it known for) → ask_google_maps.
+- When the user names a city, area or landmark ("falafel in Dubai", "ATMs near Marina Mall"), pass it as
+  near to find_nearby / find_best_dish / ask_google_maps. Only search around their current location when
+  they say "near me", "nearby" or name no place. Distances in results are from the place searched around.
+  Include the city in near when the place could be ambiguous ("Marina Mall, Abu Dhabi").
 Everything else (general knowledge, advice, small talk, translations, explanations) you answer directly,
 briefly, without a tool.
 For medical emergencies, give the nearest hospital and remind them to call an ambulance: 108 in
@@ -289,6 +293,21 @@ class KenDrive(Agent):
         super().__init__(instructions=INSTRUCTIONS, tools=extra_tools)
         self.s = state
 
+    async def _search_center(self, near: str | None) -> tuple[LatLng, str | None]:
+        """Where to search: a place the user named ("in Dubai", "near Marina Mall"), else where they are."""
+        if not near or not near.strip():
+            return self.s.location(), None
+        try:
+            here = self.s.location()
+        except ToolError:
+            here = None
+        try:
+            # Biased to the user only for local names; an unambiguous city like "Dubai" still resolves abroad.
+            p = await self.s.maps.geocode(near, near=here)
+        except MapsError as e:
+            raise ToolError(f"I couldn't find {near}.") from e
+        return (p["lat"], p["lng"]), p["name"]
+
     @function_tool
     async def find_nearby(
         self,
@@ -297,24 +316,29 @@ class KenDrive(Agent):
             "fuel", "ev_charging", "restaurant", "hospital", "parking", "atm", "pharmacy", "car_repair", "other"
         ],
         keyword: str | None = None,
+        near: str | None = None,
     ) -> dict[str, Any]:
-        """Find the closest places of a kind around the driver's current location.
+        """Find the closest places of a kind around the user, or around a place they name.
 
         Args:
             category: Kind of place. Use "other" with a keyword for anything else.
             keyword: Optional extra filter, e.g. "vegetarian", "Indian Oil", "24 hour", "Tata Power".
+            near: A city, area or landmark the user asked about ("in Dubai", "near Marina Mall").
+                Leave empty to search around the user's current location.
         """
-        loc = self.s.location()
+        loc, where = await self._search_center(near)
         try:
             places = await self.s.maps.nearby(loc, category, query=keyword, radius_m=6000, limit=5)
         except MapsError as e:
             raise ToolError(str(e)) from e
         if not places:
-            return {"result": f"No {category} found within 6 km."}
+            return {"result": f"No {category} found within 6 km of {where or 'you'}."}
         # Title from what was asked for ("Coffee nearby"), not the broad category ("Restaurants nearby").
-        title = f"{keyword.strip().capitalize()} nearby" if keyword and keyword.strip() else None
+        what = keyword.strip().capitalize() if keyword and keyword.strip() else None
+        title = f"{what or category.replace('_', ' ').capitalize()} in {where}" if where else (f"{what} nearby" if what else None)
         await self.s.push_ui({"type": "places", "category": category, "title": title, "places": places})
         return {
+            "searched_around": where or "the user's location",
             "places": [
                 {
                     "name": p["name"],
@@ -328,15 +352,17 @@ class KenDrive(Agent):
         }
 
     @function_tool
-    async def find_best_dish(self, ctx: RunContext, dish: str) -> dict[str, Any]:
+    async def find_best_dish(self, ctx: RunContext, dish: str, near: str | None = None) -> dict[str, Any]:
         """Find the best nearby place for a specific dish by reading Google reviews, Google's review
         summaries and menu snippets from the web, and keeping only places that actually serve it.
         Shows the results as cards on the driver's screen.
 
         Args:
             dish: The dish, as specific as possible, e.g. "bolognese pasta", "hyderabadi biryani".
+            near: A city, area or landmark the user asked about ("in Dubai", "near JBR").
+                Leave empty to search around the user's current location.
         """
-        loc = self.s.location()
+        loc, where = await self._search_center(near)
         area = await self.s.maps.locality(loc)
         city = area.split(", ")[-1] if area else ""
         try:
@@ -345,13 +371,13 @@ class KenDrive(Agent):
             raise ToolError(str(e)) from e
         serving = [r for r in ranked if r["evidence"] in ("on_menu", "reviewed", "likely")]
         if not serving:
-            return {"result": f"No place within 10 km clearly serves {dish}."}
+            return {"result": f"No place within 10 km of {where or 'you'} clearly serves {dish}."}
 
         await self.s.push_ui(
             {
                 "type": "places",
                 "category": "restaurant",
-                "title": f"Best {dish} near you",
+                "title": f"Best {dish} in {where}" if where else f"Best {dish} near you",
                 "places": [
                     {k: v for k, v in r.items() if k not in ("reviews", "menu_snippets")} for r in serving[:5]
                 ],
@@ -359,6 +385,7 @@ class KenDrive(Agent):
         )
         return {
             "dish": dish,
+            "searched_around": where or "the user's location",
             "ranked": [
                 {
                     "name": r["name"],
@@ -721,14 +748,15 @@ class KenDrive(Agent):
                             for r in results]}
 
     @function_tool
-    async def ask_google_maps(self, ctx: RunContext, question: str) -> dict[str, Any]:
+    async def ask_google_maps(self, ctx: RunContext, question: str, near: str | None = None) -> dict[str, Any]:
         """Ask Google Maps (Grounding Lite) about places: reviews, what a place is known for,
         kid/family friendliness, specific dishes, facilities.
 
         Args:
             question: Natural-language question, e.g. "good South Indian breakfast near me with parking".
+            near: A city, area or landmark the question is about ("in Dubai"). Leave empty for around the user.
         """
-        loc = self.s.location()
+        loc, _ = await self._search_center(near)
         res = await self.s.maps.ask_maps(question, near=loc)
         if res.get("places"):
             await self.s.push_ui({"type": "places", "category": "other", "places": res["places"]})

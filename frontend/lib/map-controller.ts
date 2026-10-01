@@ -112,7 +112,9 @@ export class MapController {
       this.placeMarkers[i] = m;
     });
     const pts: LatLng[] = places.filter((p) => p.lat != null && p.lng != null).map((p) => [p.lat!, p.lng!]);
-    if (me) pts.push([me.lat, me.lng]);
+    // Include the user only when the results are around them, not for a search in another city.
+    const near = (p: LatLng) => Math.abs(p[0] - me!.lat) < 0.5 && Math.abs(p[1] - me!.lng) < 0.5;
+    if (me && pts.length && pts.every(near)) pts.push([me.lat, me.lng]);
     if (pts.length) this.lastFit = pts;
   }
 
