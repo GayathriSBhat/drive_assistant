@@ -14,6 +14,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 import httpx
@@ -35,7 +36,7 @@ from app.ev_parking import (
 from app.parking_live import coverage, live_lots_near
 from app.parking_web import check_parking_online
 from app.maps import PLACE_FIELDS, Maps, MapsError, Route
-from app.search import web_search as ddgs_search
+from app.search import grounded_search, web_search as ddgs_search
 
 load_dotenv()
 log = logging.getLogger("kendrive")
@@ -88,13 +89,15 @@ Never say "Hi", "Hello", "هلا" or any other word in place of مرحباً, ne
 Only ever say words meant for the user. Never read out instructions, plans, steps, tool names or
 parameters — call the tool silently, then tell the user the result.
 Understand local usage: "petrol bunk" = fuel station, "signal" = traffic light, "Salik" = Dubai toll gate.
-Language: ALWAYS answer in Arabic, in the Emirati dialect (اللهجة الإماراتية), for the whole session.
-Stay in Arabic even when the user speaks or types in English or another language, and even when tool
-results, search snippets, place names or news come back in English — translate the substance into
-Arabic and keep only proper nouns (place, road, brand, person names) as they are. The only exception:
-if the user explicitly asks you to speak another language ("speak English", "talk in Hindi", "بالإنجليزي
-لو سمحت"), switch to it and stay there until they explicitly ask for Arabic again. Understanding the
-user's English is fine; replying in English is not.
+Language: Arabic is the default, in the Emirati dialect (اللهجة الإماراتية). Before every reply, look at
+the language of the user's LATEST message and reply in that same language: if they spoke English, reply
+in English; Hindi → Hindi; Arabic → Arabic; any other language → that language. Switch whenever they
+switch, including back to Arabic. A place or brand name from another language inside their sentence
+(e.g. "Dubai Mall" inside Arabic speech, or an Arabic place name inside English) does not count as a
+switch. Tool results, search snippets and news often come back in English: translate their substance
+into the language you're replying in, keeping proper nouns as they are. Before the user has said
+anything there is no language to match: the opening greeting is ALWAYS the Arabic one above, never French,
+English or anything else, and you keep using Arabic until the user's first message shows another language.
 The Emirati greeting is only the opener: from the user's first Arabic words onward, match their dialect
 (Emirati, other Gulf, Egyptian, Levantine, Iraqi, Moroccan…) and stay in it, never Modern Standard Arabic,
 even in longer answers; if the user hasn't spoken Arabic yet or you can't tell the dialect, keep using Emirati. Everyday
@@ -124,7 +127,9 @@ When a request matches one of these, use the tool instead of guessing:
 - A route from somewhere other than where they are ("from the airport to X") → plan_route with that start
   as origin; give the time and distance rather than turns. Never say a route starts anywhere other than
   the result's "from".
-- Local events, festivals, diversions, news, or anything that needs current facts → web_search.
+- Local events, things to do, festivals, diversions, news, or anything that needs current facts → web_search.
+  It already knows today's date and the user's city. Only mention items the result says are current or
+  upcoming, with their day and venue; never invent events or dates.
 - Questions about a specific place (reviews, is it good, what's it known for) → ask_google_maps.
 Everything else (general knowledge, advice, small talk, translations, explanations) you answer directly,
 briefly, without a tool.
@@ -685,17 +690,34 @@ class KenDrive(Agent):
 
     @function_tool
     async def web_search(self, ctx: RunContext, query: str, news: bool = False) -> dict[str, Any]:
-        """Search the web with DuckDuckGo. Use for festivals, processions, road closures, diversions,
-        weather events, or any general question.
+        """Search the web for current information: events and things to do, festivals, processions,
+        road closures, diversions, weather events, news, or any general question.
 
         Args:
-            query: Search query. Include the city/area for local topics.
+            query: What to look up, e.g. "events this weekend" or "concerts tonight". The user's city and
+                today's date are added automatically.
             news: True for recent news (last few days) instead of general web results.
         """
-        results = await ddgs_search(query, news=news, max_results=5, timelimit="w" if news else None)
+        try:
+            loc = self.s.location()
+        except ToolError:
+            loc = None
+        area = await self.s.maps.locality(loc) if loc else ""
+        # Local date: approximate the timezone from longitude (UAE ≈ +4, India ≈ +5.5).
+        now = datetime.now(timezone.utc) + timedelta(hours=round(loc[1] / 7.5) / 2 if loc else 0)
+        today = now.strftime("%A %d %B %Y")
+        answer = await grounded_search(query, today=today, place=area)
+        if answer:
+            return {"today": today, "area": area or None, "answer": answer}
+
+        # Fallback: DuckDuckGo, anchored to the city and month so it doesn't return stale pages.
+        city = area.split(", ")[-1] if area else ""
+        q = " ".join(x for x in (query, "" if city.lower() in query.lower() else city, now.strftime("%B %Y")) if x)
+        results = await ddgs_search(q, news=news, max_results=5, timelimit="w" if news else "m")
         if not results:
-            return {"results": "No results found."}
-        return {"results": [{"title": r["title"], "snippet": (r["snippet"] or "")[:300], "date": r.get("date")}
+            return {"today": today, "results": "No current results found."}
+        return {"today": today, "area": area or None,
+                "results": [{"title": r["title"], "snippet": (r["snippet"] or "")[:300], "date": r.get("date")}
                             for r in results]}
 
     @function_tool

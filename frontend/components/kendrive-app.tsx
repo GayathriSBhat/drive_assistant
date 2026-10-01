@@ -1,7 +1,7 @@
 "use client";
 
 import { LiveKitRoom } from "@livekit/components-react";
-import { Maximize2, Minimize2, X } from "lucide-react";
+import { ChevronUp, Maximize2, Minimize2, X } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { fmtDist, fmtDur } from "@/lib/format";
 import { MapController } from "@/lib/map-controller";
@@ -99,6 +99,11 @@ export default function KenDriveApp() {
   // The map floats in as a card when there's something to show (results or a route); tap to expand it.
   const [mapView, setMapView] = useState<"hidden" | "card" | "expanded">("hidden");
   const [toast, setToast] = useState<Toast | null>(null);
+  // Results, the route and weather live in a bottom drawer: it pops up with each new result, closes when
+  // the call ends, and the driver can close / reopen it any time.
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [drawerDrag, setDrawerDrag] = useState(0); // px dragged down by the handle
+  const dragStart = useRef<number | null>(null);
 
   const loc: Loc | null = locMode === "gps" ? trackedLoc : DEMO[locMode];
   const locRef = useRef(loc);
@@ -234,6 +239,14 @@ export default function KenDriveApp() {
     setMicMuted(false);
     setAgentState("idle");
     setWeather(null);
+    // Hanging up clears everything the call put on screen: cards, route and map pins.
+    setDrawerOpen(false);
+    setResults(null);
+    setRoute(null);
+    setMapView("hidden");
+    mapRef.current?.clearPlaces();
+    mapRef.current?.clearRoute();
+    mapRef.current?.setFit(null);
   }, [showToast]);
   const onMediaDeviceFailure = useCallback(() => {
     setMicAvailable(false);
@@ -290,7 +303,8 @@ export default function KenDriveApp() {
     (evt: UiEvent) => {
       const ctl = mapRef.current;
       if (evt.type === "places") {
-        setWeather(null); // the dock shows the newest card only
+        setWeather(null); // the drawer shows the newest card only
+        setDrawerOpen(true);
         setResults({ title: evt.title ?? CATEGORY_TITLES[evt.category] ?? CATEGORY_TITLES.other, category: evt.category, places: evt.places });
         try {
           ctl?.showPlaces(evt.places, evt.category, locRef.current);
@@ -300,6 +314,7 @@ export default function KenDriveApp() {
         setMapView((v) => (v === "hidden" ? "card" : v));
       } else if (evt.type === "route") {
         setWeather(null);
+        setDrawerOpen(true);
         const c = evt.chosen;
         let path: LatLng[] = [];
         try {
@@ -322,6 +337,7 @@ export default function KenDriveApp() {
         setMapView((v) => (v === "hidden" ? "card" : v));
       } else if (evt.type === "weather") {
         setWeather(evt);
+        setDrawerOpen(true);
       } else if (evt.type === "clear_route") {
         ctl?.clearRoute();
         setRoute(null);
@@ -366,8 +382,12 @@ export default function KenDriveApp() {
   // While cards are up, shrink the orb and centre it + the captions in the space that's actually free:
   // between the top (or the map card, when it's showing) and the top of the dock. Measured, not guessed,
   // so it holds on any screen and whether or not the map is available.
-  const compact = mapView !== "hidden" || !!results || !!route || !!weather;
-  const mapShown = mapReady && mapView === "card";
+  const hasDrawer = !!results || !!route || !!weather;
+  const drawerShown = drawerOpen && hasDrawer;
+  // The map card belongs with the drawer: closing the drawer tucks the map away too.
+  const shownMapView = drawerShown ? mapView : "hidden";
+  const compact = drawerShown;
+  const mapShown = mapReady && shownMapView === "card";
   useLayoutEffect(() => {
     const stage = stageRef.current;
     const dock = dockRef.current;
@@ -394,16 +414,30 @@ export default function KenDriveApp() {
     ro.observe(dock);
     if (mapCardRef.current) ro.observe(mapCardRef.current); // its height animates when expanding / shrinking
     return () => ro.disconnect();
-  }, [compact, mapShown, results, route, weather, live, conn]);
+  }, [compact, mapShown, results, route, weather, live, conn, drawerShown]);
+
+  const drawerTitle = weather ? "Weather" : results ? results.title : route ? "Route" : "";
+  const onHandleDown = (e: React.PointerEvent) => {
+    dragStart.current = e.clientY;
+    (e.target as HTMLElement).setPointerCapture(e.pointerId);
+  };
+  const onHandleMove = (e: React.PointerEvent) => {
+    if (dragStart.current != null) setDrawerDrag(Math.max(0, e.clientY - dragStart.current));
+  };
+  const onHandleUp = () => {
+    if (drawerDrag > 70) setDrawerOpen(false);
+    dragStart.current = null;
+    setDrawerDrag(0);
+  };
 
   return (
-    <div className="phone" ref={phoneRef} data-map={mapView}>
+    <div className="phone" ref={phoneRef} data-map={shownMapView}>
       {/* Floating map card: outside the room, which remounts its children on connect (Leaflet must keep its element). */}
       <section
         className="float-map"
         ref={mapCardRef}
-        data-view={mapReady ? mapView : "hidden"}
-        aria-hidden={!mapReady || mapView === "hidden"}
+        data-view={mapReady ? shownMapView : "hidden"}
+        aria-hidden={!mapReady || shownMapView === "hidden"}
         aria-label="Map"
       >
         <div id="map" ref={mapElRef} />
@@ -465,32 +499,66 @@ export default function KenDriveApp() {
               )}
             </div>
           )}
-          {weather && <WeatherCard weather={weather} onClose={() => setWeather(null)} />}
-          {/* Weather sits on top of the route / results; closing it brings them back. */}
-          {results && !weather && mapView !== "expanded" && (
-            <ResultCards
-              ref={cardsRef}
-              places={results.places}
-              onNavigate={(p) => void say(`Take me to ${p.name}, ${p.address ?? ""}`)}
-              onFocus={(i) => mapRef.current?.focus(i)}
-              scrollTo={pinFocus}
-            />
-          )}
-          {route && !results && !weather && (
-            <div className="route-card" ref={routeCardRef}>
-              <div className="route-main">
-                <div>
-                  <div className="eta">
-                    {route.eta}
-                    <small>{route.distance}</small>
-                  </div>
-                  <div className="route-sub">{route.detail}</div>
-                </div>
-                <button className="icon-btn small" onClick={clearRoute} aria-label="Clear route">
-                  <X size={14} />
+          {drawerShown && (
+            <section
+              className="drawer"
+              aria-label={drawerTitle}
+              style={drawerDrag ? { transform: `translateY(${drawerDrag}px)`, transition: "none" } : undefined}
+            >
+              <div
+                className="drawer-head"
+                onPointerDown={onHandleDown}
+                onPointerMove={onHandleMove}
+                onPointerUp={onHandleUp}
+                onPointerCancel={onHandleUp}
+              >
+                <span className="drawer-handle" />
+                <div className="drawer-title">{drawerTitle}</div>
+                <button
+                  className="icon-btn drawer-close"
+                  aria-label="Close"
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onClick={() => setDrawerOpen(false)}
+                >
+                  <X size={15} />
                 </button>
               </div>
-            </div>
+              <div className="drawer-body">
+                {weather && <WeatherCard weather={weather} onClose={() => setWeather(null)} />}
+                {/* Weather sits on top of the route / results; closing it brings them back. */}
+                {results && !weather && mapView !== "expanded" && (
+                  <ResultCards
+                    ref={cardsRef}
+                    places={results.places}
+                    onNavigate={(p) => void say(`Take me to ${p.name}, ${p.address ?? ""}`)}
+                    onFocus={(i) => mapRef.current?.focus(i)}
+                    scrollTo={pinFocus}
+                  />
+                )}
+                {route && !results && !weather && (
+                  <div className="route-card" ref={routeCardRef}>
+                    <div className="route-main">
+                      <div>
+                        <div className="eta">
+                          {route.eta}
+                          <small>{route.distance}</small>
+                        </div>
+                        <div className="route-sub">{route.detail}</div>
+                      </div>
+                      <button className="icon-btn small" onClick={clearRoute} aria-label="Clear route">
+                        <X size={14} />
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </section>
+          )}
+          {live && hasDrawer && !drawerShown && (
+            <button className="drawer-pill" onClick={() => setDrawerOpen(true)}>
+              <ChevronUp size={15} />
+              {drawerTitle}
+            </button>
           )}
           <ConversationBar
             live={live}

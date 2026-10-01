@@ -1,8 +1,9 @@
-"""DuckDuckGo web + news search via the `ddgs` package."""
+"""Web search: Gemini with Google Search grounding, and DuckDuckGo (`ddgs`) web + news as a fallback."""
 
 from __future__ import annotations
 
 import asyncio
+import os
 import logging
 from typing import Any
 
@@ -32,3 +33,38 @@ async def web_search(
     query: str, *, news: bool = False, max_results: int = 5, timelimit: str | None = None
 ) -> list[dict[str, Any]]:
     return await asyncio.to_thread(_search, query, news, max_results, timelimit)
+
+
+GROUNDED_PROMPT = """Today is {today}. The user is in {place}.
+Answer this using a Google search for current information: {query}
+Rules: only include things that are current, ongoing or upcoming from today onward (drop anything that
+already ended). For events give the name, venue, and dates/times. Be concrete and brief: at most 5 items,
+one short line each, plain text, no URLs, no markdown. If you can't find anything current, say so."""
+
+
+async def grounded_search(query: str, *, today: str, place: str) -> str | None:
+    """Gemini + Google Search grounding: a short, date-aware answer with real names. None on failure."""
+    key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    if not key:
+        return None
+    from google import genai
+    from google.genai import types
+
+    try:
+        client = genai.Client(api_key=key)
+        resp = await asyncio.wait_for(
+            client.aio.models.generate_content(
+                model=os.getenv("GEMINI_TEXT_MODEL", "gemini-flash-latest"),
+                contents=GROUNDED_PROMPT.format(today=today, place=place or "an unknown city", query=query),
+                config=types.GenerateContentConfig(
+                    tools=[types.Tool(google_search=types.GoogleSearch())],
+                    temperature=0.2,
+                    thinking_config=types.ThinkingConfig(thinking_level="low"),
+                ),
+            ),
+            timeout=20,
+        )
+        return (resp.text or "").strip() or None
+    except Exception as e:
+        log.warning("grounded search for %r failed: %s", query, e)
+        return None
